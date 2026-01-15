@@ -1,0 +1,5 @@
+{
+  "name": "FireSim",
+  "description": "Real-time 3D fire and fluid simulation powered by WebGPU compute shaders.",
+  "requestFramePermissions": []
+}

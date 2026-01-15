@@ -1,0 +1,41 @@
+{
+  "name": "firesim",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Real-time 3D fire and fluid simulation powered by WebGPU compute shaders",
+  "author": "Alex F",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "webgpu",
+    "wgsl",
+    "simulation",
+    "fire",
+    "fluid-dynamics",
+    "gpu",
+    "graphics",
+    "compute-shaders",
+    "3d",
+    "real-time"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alexf/firesim"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "lucide-react": "^0.562.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
+  }
+}
