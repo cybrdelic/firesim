@@ -41,15 +41,49 @@ npm run build
 npm run preview
 ```
 
+### Stability Harness
+
+Run deterministic stability checks (fuzz + visual regression):
+
+```bash
+npm run test:stability
+```
+
+Generate/update snapshot baselines:
+
+```bash
+npm run test:stability:update
+```
+
+The app supports deterministic sweep mode via URL params:
+
+- `deterministic=1` - fixed simulation time step
+- `sweep=1` - enables readiness/status reporting for automation
+- `scene=<id>` - initial scene preset
+- `grid=<64|128|192|256>` - initial grid size
+- `smoke=<0|1>` - smoke toggle
+- `maxFrames=<n>` - freeze after `n` deterministic frames
+
+Automation status/control hooks are available on `window`:
+
+- `window.__FIRE_SIM_STATUS__`
+- `window.__FIRE_SIM_CONTROL__`
+
+Detailed limits and edge-case notes are documented in [STABILITY.md](STABILITY.md).
+
 ## 🏗️ Project Structure
 
 ```
 firesim/
 ├── components/
-│   ├── FluidSimulation.tsx  # WebGPU fluid/fire simulation engine
-│   ├── CodeBlock.tsx        # UI component for code display
-│   ├── ProgressHeader.tsx   # UI header component
+│   ├── FluidSimulation.tsx   # UI + lifecycle + runtime harness integration
+│   ├── fluid/
+│   │   └── engine.ts         # WebGPU transport, shaders, presets, parameter sanitization
+│   ├── CodeBlock.tsx         # UI component for code display
+│   ├── ProgressHeader.tsx    # UI header component
 │   └── SafetyPatternCard.tsx # Info card component
+├── tests/stability/         # Playwright fuzz + snapshot stability harness
+├── webgpu.d.ts              # Local WebGPU DOM typing surface for this project
 ├── utils/
 │   └── generator.ts         # Utility functions
 ├── App.tsx                  # Main application component
