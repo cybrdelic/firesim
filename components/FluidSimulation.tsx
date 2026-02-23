@@ -549,8 +549,21 @@ fn compute_reaction(pos: vec3f) -> f32 {
   let gradMag = length(grad) * 0.5;
 
   let tempGate = smoothstep(0.18, 0.55, temp);
-  let gradGate = smoothstep(0.02, 0.12, gradMag);
-  return tempGate * gradGate;
+
+  // Sharpen the reaction front so emission collapses into sheets/tongues.
+  let front = smoothstep(0.035, 0.055, gradMag);
+  let r = tempGate * front;
+  return pow(clamp(r, 0.0, 1.0), 4.0);
+}
+
+fn tonemap_aces(color: vec3f) -> vec3f {
+  // ACES approximation (Narkowicz 2015). Keeps HDR highlights structured.
+  let a = 2.51;
+  let b = 0.03;
+  let c = 2.43;
+  let d = 0.59;
+  let e = 0.14;
+  return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3f(0.0), vec3f(1.0));
 }
 
 fn phase_function(costheta: f32, g: f32) -> f32 {
@@ -678,7 +691,7 @@ fn get_floor_material(p: vec3f) -> vec3f {
 
   // Early exit if ray misses volume - just show floor/background
   if (t.x > t.y || t.y < 0.0) {
-    let mapped = clamp(floor_color * params.exposure, vec3f(0.0), vec3f(1.0));
+    let mapped = tonemap_aces(floor_color * params.exposure);
     return vec4f(pow(mapped, vec3f(1.0 / params.gamma)), 1.0);
   }
 
@@ -766,7 +779,7 @@ fn get_floor_material(p: vec3f) -> vec3f {
 
   // Use same floor_color calculated at start
   let surfaceCol = select(floor_color, solidColor, hasSolid);
-  let mapped = clamp((accumCol + transmittance * surfaceCol) * params.exposure, vec3f(0.0), vec3f(1.0));
+  let mapped = tonemap_aces((accumCol + transmittance * surfaceCol) * params.exposure);
   return vec4f(pow(mapped, vec3f(1.0 / params.gamma)), 1.0);
 }
 `;
