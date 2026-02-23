@@ -534,6 +534,25 @@ fn sample_volume(pos: vec3f) -> vec2f {
   return vec2f(f_res, s_res);
 }
 
+fn compute_reaction(pos: vec3f) -> f32 {
+  // Flame lives on thin temperature edges, not in the hot volume.
+  // reaction = smoothstep(T_ignite, T_hot, T) * smoothstep(g0, g1, |∇T|)
+  let temp = sample_volume(pos).x;
+  let eps = 1.0 / params.dim;
+  let txp = sample_volume(pos + vec3f(eps, 0.0, 0.0)).x;
+  let txn = sample_volume(pos - vec3f(eps, 0.0, 0.0)).x;
+  let typ = sample_volume(pos + vec3f(0.0, eps, 0.0)).x;
+  let tyn = sample_volume(pos - vec3f(0.0, eps, 0.0)).x;
+  let tzp = sample_volume(pos + vec3f(0.0, 0.0, eps)).x;
+  let tzn = sample_volume(pos - vec3f(0.0, 0.0, eps)).x;
+  let grad = vec3f(txp - txn, typ - tyn, tzp - tzn);
+  let gradMag = length(grad) * 0.5;
+
+  let tempGate = smoothstep(0.18, 0.55, temp);
+  let gradGate = smoothstep(0.02, 0.12, gradMag);
+  return tempGate * gradGate;
+}
+
 fn phase_function(costheta: f32, g: f32) -> f32 {
     let g2 = g * g; return (1.0 - g2) / (4.0 * 3.14159 * pow(1.0 + g2 - 2.0 * g * costheta, 1.5));
 }
@@ -550,7 +569,9 @@ fn get_light_transmittance(pos: vec3f, lightDir: vec3f) -> f32 {
     var p = pos; let step = 0.045; var densitySum = 0.0;
     for(var i=0; i<12; i++) {
         p += lightDir * step; if (p.x < 0.0 || p.x > 1.0 || p.y > 1.0 || p.z < 0.0 || p.z > 1.0 || p.y < 0.0) { break; }
-        let val = sample_volume(p); densitySum += val.y * params.absorption + val.x * 0.15;
+    let val = sample_volume(p);
+    // Extinction is smoke/soot only. Hot gas does not absorb by itself.
+    densitySum += val.y * params.absorption;
     }
     return exp(-densitySum * step * 18.0);
 }
@@ -586,16 +607,17 @@ fn get_volume_lighting(pos: vec3f) -> vec3f {
 
             let val = sample_volume(p);
 
+            let reaction = compute_reaction(p);
+
             // Fire emits light downward to floor
-            if (val.x > 0.02) {
-                let emission = getBlackbodyColor(val.x * params.emission * 0.3);
+            if (reaction > 0.01) {
+              let emission = getBlackbodyColor(val.x * params.emission * 0.3) * reaction;
                 let atten = 1.0 / (1.0 + t * t * 5.0);
-                totalLight += emission * val.x * atten * transmittance * 0.12;
+              totalLight += emission * atten * transmittance * 0.12;
             }
 
             // Smoke blocks light
-            let density = val.y * 1.5 + val.x * 0.15;
-            transmittance *= exp(-density * 0.06 * params.absorption * 0.3);
+            transmittance *= exp(-(val.y * params.absorption) * 0.06 * 0.3);
 
             t += 0.06;
         }
@@ -721,14 +743,23 @@ fn get_floor_material(p: vec3f) -> vec3f {
       if (transmittance < 0.005) { break; }
       if (all(pos >= vec3f(0.0)) && all(pos <= vec3f(1.0))) {
            let val = sample_volume(pos);
-           // No boundary fade - fire extends naturally
-           let total_d = val.y * 1.8 + val.x * 0.15;
-           if (total_d > 0.0001) {
-               let sunTrans = get_light_transmittance(pos, lightDir);
-               let radiance = vec3f(12.0) * sunTrans * phaseSun * mix(vec3f(0.6, 0.65, 0.7), vec3f(0.2, 0.18, 0.15), clamp(val.y * 1.8 * 1.2, 0.0, 1.0)) * params.scattering + getBlackbodyColor(val.x * params.emission);
-               let stepTrans = exp(-((val.y * 1.8 * params.absorption * 22.0) + (val.x * 0.4)) * stepSize);
-               accumCol += radiance * (1.0 - stepTrans) * transmittance; transmittance *= stepTrans;
-           }
+         let soot = val.y;
+         let reaction = compute_reaction(pos);
+         if (soot > 0.0001 || reaction > 0.0001) {
+           let sunTrans = get_light_transmittance(pos, lightDir);
+           let scatter = vec3f(12.0) * sunTrans * phaseSun * mix(vec3f(0.6, 0.65, 0.7), vec3f(0.2, 0.18, 0.15), clamp(soot * 1.8 * 1.2, 0.0, 1.0)) * params.scattering;
+
+           // Flame-only emission: reaction emits, soot absorbs.
+           let emission = getBlackbodyColor(val.x * params.emission) * reaction;
+
+           let extinction = soot * params.absorption * 22.0;
+           let stepTrans = exp(-(extinction) * stepSize);
+
+           // In-scattering scales with extinction, emission integrates along the ray.
+           accumCol += scatter * (1.0 - stepTrans) * transmittance;
+           accumCol += emission * transmittance * stepSize;
+           transmittance *= stepTrans;
+         }
       }
       pos += rd * stepSize;
   }
@@ -1529,6 +1560,15 @@ const FluidSimulation: React.FC = () => {
 
         <div className="deck-topbar-right">
           <button type="button" className="deck-tool" aria-label="Diagnostics"><AlertTriangle size={16} /></button>
+          <button
+            type="button"
+            className={`deck-tool ${isSmokeEnabled ? 'is-active' : ''}`}
+            aria-label={isSmokeEnabled ? 'Disable smoke' : 'Enable smoke'}
+            aria-pressed={isSmokeEnabled}
+            onClick={() => setIsSmokeEnabled((prev) => !prev)}
+          >
+            <Droplet size={16} />
+          </button>
           <button type="button" className="deck-tool" aria-label="Capture" onClick={captureFrame}><Camera size={16} /></button>
 
           <div className="deck-metrics" aria-label="Performance summary">
