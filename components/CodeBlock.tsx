@@ -1,5 +1,5 @@
-import React from 'react';
 import { Copy } from 'lucide-react';
+import React from 'react';
 
 interface Props {
   title: string;
@@ -19,10 +19,11 @@ const CodeBlock: React.FC<Props> = ({ title, code, language }) => {
           <span className={`w-3 h-3 rounded-full ${language === 'typescript' ? 'bg-blue-500' : 'bg-orange-500'}`}></span>
           <span className="text-sm font-mono font-medium text-slate-200">{title}</span>
         </div>
-        <button 
+        <button
           onClick={handleCopy}
           className="p-1.5 hover:bg-slate-700 rounded-md text-slate-400 transition-colors"
-          title="Copy to clipboard"
+          aria-label="Copy to clipboard"
+          data-tooltip="Copy to clipboard"
         >
           <Copy size={16} />
         </button>

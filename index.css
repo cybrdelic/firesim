@@ -40,6 +40,29 @@ body {
   text-rendering: geometricPrecision;
 }
 
+.app-tooltip-layer {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+}
+
+.app-tooltip {
+  position: absolute;
+  max-width: 260px;
+  padding: 7px 9px;
+  border-radius: 10px;
+  border: 1px solid var(--panel-border);
+  background: color-mix(in srgb, var(--panel-bg) 88%, transparent);
+  box-shadow: var(--panel-shadow);
+  color: var(--text-main);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.25;
+  letter-spacing: 0.01em;
+  white-space: pre-line;
+}
+
 .app-shell {
   width: 100%;
   height: 100%;
@@ -1398,6 +1421,7 @@ body {
   right: 0;
   top: 7px;
   height: 4px;
+  pointer-events: none;
   border-radius: 999px;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(0, 0, 0, 0.24)),
@@ -1415,6 +1439,7 @@ body {
   top: 7px;
   height: 4px;
   width: calc(var(--t, 0) * 100%);
+  pointer-events: none;
   border-radius: 999px;
   background: var(--fill);
   box-shadow: 0 0 20px rgba(255, 140, 70, 0.18);
@@ -1433,6 +1458,7 @@ body {
   inset: 0;
   width: 100%;
   margin: 0;
+  z-index: 1;
   appearance: none;
   background: transparent;
 }
@@ -1512,6 +1538,7 @@ body {
   right: 0;
   top: 6px;
   height: 4px;
+  pointer-events: none;
   border-radius: 999px;
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(0, 0, 0, 0.22));
   box-shadow:
@@ -1524,6 +1551,7 @@ body {
   inset: 0;
   width: 100%;
   margin: 0;
+  z-index: 1;
   appearance: none;
   background: transparent;
 }
@@ -1531,6 +1559,7 @@ body {
 .deck-range-ticks {
   position: absolute;
   inset: 6px 0 6px 0;
+  pointer-events: none;
   border-radius: 999px;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(0, 0, 0, 0.18)),

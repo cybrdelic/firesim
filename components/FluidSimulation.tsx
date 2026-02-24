@@ -3,6 +3,7 @@ import {
     AlertTriangle,
     Camera,
     ChevronDown,
+    Copy,
     Droplet,
     Eye,
     Flame,
@@ -57,6 +58,8 @@ class FluidTransport {
 
   public densityA: GPUBuffer;
   public densityB: GPUBuffer;
+  public fuelA: GPUBuffer;
+  public fuelB: GPUBuffer;
   public velocityA: GPUBuffer;
   public velocityB: GPUBuffer;
 
@@ -79,6 +82,9 @@ class FluidTransport {
     this.densityA = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
     this.densityB = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
 
+    this.fuelA = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
+    this.fuelB = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
+
     this.velocityA = device.createBuffer({ size: VOXEL_COUNT * 16, usage: storageUsage });
     this.velocityB = device.createBuffer({ size: VOXEL_COUNT * 16, usage: storageUsage });
 
@@ -87,6 +93,8 @@ class FluidTransport {
 
     device.queue.writeBuffer(this.densityA, 0, zeroF32);
     device.queue.writeBuffer(this.densityB, 0, zeroF32);
+    device.queue.writeBuffer(this.fuelA, 0, zeroF32);
+    device.queue.writeBuffer(this.fuelB, 0, zeroF32);
     device.queue.writeBuffer(this.velocityA, 0, zeroVec4);
     device.queue.writeBuffer(this.velocityB, 0, zeroVec4);
 
@@ -101,12 +109,15 @@ class FluidTransport {
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     ]);
 
     this.renderContract = new ShaderContract(this.device, 'Render', [
       { binding: 0, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
       { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     ]);
   }
 
@@ -117,12 +128,15 @@ class FluidTransport {
       { binding: 2, resource: { buffer: this.densityB } },
       { binding: 3, resource: { buffer: this.velocityA } },
       { binding: 4, resource: { buffer: this.velocityB } },
+      { binding: 5, resource: { buffer: this.fuelA } },
+      { binding: 6, resource: { buffer: this.fuelB } },
     ]);
 
     this.renderGroups[0] = this.renderContract.createBindGroup(this.device, 'Render0', [
       { binding: 0, resource: { buffer: this.uniformBuffer } },
       { binding: 1, resource: { buffer: this.densityB } },
       { binding: 2, resource: { buffer: this.velocityB } },
+      { binding: 3, resource: { buffer: this.fuelB } },
     ]);
 
     this.physicsGroups[1] = this.physicsContract.createBindGroup(this.device, 'Phys1', [
@@ -131,12 +145,15 @@ class FluidTransport {
       { binding: 2, resource: { buffer: this.densityA } },
       { binding: 3, resource: { buffer: this.velocityB } },
       { binding: 4, resource: { buffer: this.velocityA } },
+      { binding: 5, resource: { buffer: this.fuelB } },
+      { binding: 6, resource: { buffer: this.fuelA } },
     ]);
 
     this.renderGroups[1] = this.renderContract.createBindGroup(this.device, 'Render1', [
       { binding: 0, resource: { buffer: this.uniformBuffer } },
       { binding: 1, resource: { buffer: this.densityA } },
       { binding: 2, resource: { buffer: this.velocityA } },
+      { binding: 3, resource: { buffer: this.fuelA } },
     ]);
   }
 
@@ -186,6 +203,35 @@ class FluidTransport {
     view.setFloat32(112, params.fuelEfficiency || 1.0, true);
     view.setFloat32(116, params.heatDiffusion || 0.0, true);
     view.setFloat32(120, params.stepQuality || 1.0, true);
+    view.setFloat32(124, 0.0, true); // pad4
+
+    // Extended combustion + smoke taxonomy + rendering controls.
+    const fuelEff = params.fuelEfficiency || 1.0;
+    const heightFactor = clamp(params.buoyancy / 8.0, 0.5, 5.0);
+    const baseBurnRate = params.burnRate ?? fuelEff * 6.0;
+    const baseFuelInject = params.fuelInject ?? (0.4 + fuelEff * 0.6);
+    const derivedBurnRate = baseBurnRate / heightFactor;
+    const derivedFuelInject = baseFuelInject * heightFactor;
+    const derivedVolumeHeight = params.volumeHeight ?? 1.0;
+    view.setFloat32(128, params.T_ignite ?? 0.18, true);
+    view.setFloat32(132, params.T_burn ?? 0.55, true);
+    view.setFloat32(136, derivedBurnRate, true);
+    view.setFloat32(140, derivedFuelInject, true);
+
+    view.setFloat32(144, params.heatYield ?? 3.4, true);
+    view.setFloat32(148, params.sootYieldFlame ?? 0.22, true);
+    view.setFloat32(152, params.sootYieldSmolder ?? 0.55, true);
+    view.setFloat32(156, params.hazeConvertRate ?? 0.0, true);
+
+    view.setFloat32(160, params.T_hazeStart ?? 0.35, true);
+    view.setFloat32(164, params.T_hazeFull ?? 0.75, true);
+    view.setFloat32(168, params.anisotropyG ?? 0.82, true);
+    view.setFloat32(172, params.smokeThickness ?? 1.0, true);
+
+    view.setFloat32(176, params.smokeDarkness ?? 0.65, true);
+    view.setFloat32(180, params.flameSharpness ?? 4.0, true);
+    view.setFloat32(184, params.sootDissipation ?? params.smokeDissipation ?? 0.985, true);
+    view.setFloat32(188, derivedVolumeHeight, true);
 
     this.device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
   }
@@ -233,6 +279,27 @@ struct SimParams {
   heatDiffusion: f32,
   stepQuality: f32,
   pad4: f32,
+
+  // Extended combustion + smoke taxonomy + rendering controls
+  T_ignite: f32,
+  T_burn: f32,
+  burnRate: f32,
+  fuelInject: f32,
+
+  heatYield: f32,
+  sootYieldFlame: f32,
+  sootYieldSmolder: f32,
+  hazeConvertRate: f32,
+
+  T_hazeStart: f32,
+  T_hazeFull: f32,
+  anisotropyG: f32,
+  smokeThickness: f32,
+
+  smokeDarkness: f32,
+  flameSharpness: f32,
+  sootDissipation: f32,
+  volumeHeight: f32,
 };
 `;
 
@@ -305,11 +372,22 @@ ${WOOD_SDF_FN}
 @group(0) @binding(2) var<storage, read_write> densityOut: array<f32>;
 @group(0) @binding(3) var<storage, read> velocityIn: array<vec4f>;
 @group(0) @binding(4) var<storage, read_write> velocityOut: array<vec4f>;
+@group(0) @binding(5) var<storage, read> fuelIn: array<f32>;
+@group(0) @binding(6) var<storage, read_write> fuelOut: array<f32>;
 
 fn get_idx(p: vec3i) -> u32 {
   let d = i32(params.dim);
   let cp = clamp(p, vec3i(0), vec3i(d - 1));
   return u32(cp.z * d * d + cp.y * d + cp.x);
+}
+
+fn inside_volume_world(p: vec3f) -> bool {
+  return p.x >= 0.0 && p.x <= 1.0 && p.z >= 0.0 && p.z <= 1.0 && p.y >= 0.0 && p.y <= params.volumeHeight;
+}
+
+fn to_volume_uv(p: vec3f) -> vec3f {
+  let h = max(0.0001, params.volumeHeight);
+  return vec3f(p.x, clamp(p.y / h, 0.0, 1.0), p.z);
 }
 
 fn safe_normalize(v: vec3f) -> vec3f {
@@ -356,8 +434,9 @@ fn voronoi_cracks(p: vec3f) -> f32 {
 
 struct State {
   vel: vec3f,
-  matter: f32,
+  soot: f32,
   temp: f32,
+  fuel: f32,
 };
 
 fn sample_state(pos: vec3f) -> State {
@@ -386,7 +465,18 @@ fn sample_state(pos: vec3f) -> State {
   let f011 = densityIn[get_idx(vec3i(i0.x, i1.y, i1.z))];
   let f111 = densityIn[get_idx(vec3i(i1.x, i1.y, i1.z))];
   let fm = mix(mix(mix(f000, f100, u.x), mix(f010, f110, u.x), u.y), mix(mix(f001, f101, u.x), mix(f011, f111, u.x), u.y), u.z);
-  return State(vm.xyz, vm.w, fm);
+
+  let fu000 = fuelIn[get_idx(vec3i(i0.x, i0.y, i0.z))];
+  let fu100 = fuelIn[get_idx(vec3i(i1.x, i0.y, i0.z))];
+  let fu010 = fuelIn[get_idx(vec3i(i0.x, i1.y, i0.z))];
+  let fu110 = fuelIn[get_idx(vec3i(i1.x, i1.y, i0.z))];
+  let fu001 = fuelIn[get_idx(vec3i(i0.x, i0.y, i1.z))];
+  let fu101 = fuelIn[get_idx(vec3i(i1.x, i0.y, i1.z))];
+  let fu011 = fuelIn[get_idx(vec3i(i0.x, i1.y, i1.z))];
+  let fu111 = fuelIn[get_idx(vec3i(i1.x, i1.y, i1.z))];
+  let fum = mix(mix(mix(fu000, fu100, u.x), mix(fu010, fu110, u.x), u.y), mix(mix(fu001, fu101, u.x), mix(fu011, fu111, u.x), u.y), u.z);
+
+  return State(vm.xyz, vm.w, fm, fum);
 }
 
 fn curl(p: vec3i) -> vec3f {
@@ -419,12 +509,17 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   if (usesWood) { woodDist = get_wood_sdf(uvw); }
 
   let vel = velocityIn[idx].xyz;
-  let backPos = uvw - vel * dt * (1.3 / params.dim) * 12.0;
+  // High buoyancy can produce very large velocities, which makes the semi-Lagrangian
+  // backtrace jump out of bounds and collapse the flame (samples clamp to borders).
+  // Reduce the backtrace distance as buoyancy rises to keep advection stable.
+  let advectGain = 12.0 * clamp(8.0 / (8.0 + params.buoyancy), 0.25, 1.0);
+  let backPos = uvw - vel * dt * (1.3 / params.dim) * advectGain;
   var state = sample_state(backPos);
 
   var newVel = state.vel;
   var temp = state.temp;
-  var matter = state.matter;
+  var soot = state.soot;
+  var fuel = state.fuel;
 
   // External forces: Wind
   newVel += vec3f(params.windX, 0.0, params.windZ) * dt * 40.0;
@@ -437,15 +532,18 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
       temp = mix(temp, T_avg, params.heatDiffusion * dt * 10.0);
   }
 
-  let localOxygen = smoothstep(1.2, 0.2, matter);
+  // Cheap oxygen proxy (no separate oxygen field yet): soot self-shades combustion.
+  // Once soot is generated from reaction, this hack becomes self-consistent enough.
+  let localOxygen = smoothstep(1.2, 0.2, soot);
   let insulation_factor = smoothstep(0.12, 0.0, woodDist);
   let insulation = mix(params.dissipation, 1.0, insulation_factor * 0.88);
   temp *= insulation;
-  let burnt = max(0.0, state.temp - temp);
-  matter = matter * params.smokeDissipation + burnt * 2.8;
+
+  // Species persistence (soot lingers; fuel only decreases via reaction)
+  soot *= params.sootDissipation;
 
   let buoyancyDir = vec3f(0.0, 1.0, 0.0);
-  let thermalLift = (pow(temp, 1.25) * 0.4) - (matter * params.smokeWeight * 0.0018);
+  let thermalLift = max(0.0, (pow(temp, 1.25) * 0.4) - (soot * params.smokeWeight * 0.0018));
   newVel += buoyancyDir * thermalLift * params.buoyancy * dt * 20.0;
   newVel *= max(0.0, 1.0 - params.drag);
 
@@ -473,21 +571,48 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
          let crack_field = voronoi_cracks(uvw * 22.0 + params.time * 0.1);
          let crack_mask = smoothstep(0.0, 0.2, crack_field);
          let n_val = noise_fbm(uvw * 15.0 + params.time * 0.5);
-         let fuelAvailability = logSurfaceZone;
-         let combustionIntensity = smoothstep(-0.2, 0.8, n_val) * fuelAvailability * localOxygen;
-         let emissionRate = params.emission * (1.0 + crack_mask * 2.5) * params.fuelEfficiency;
-         let intensity = combustionIntensity * emissionRate * 0.3;
-         let damping = exp(-temp * 2.0);
-         temp += intensity * 1.2 * damping;
-         matter += intensity * 1.5 * damping;
+        // Fuel injection at the wood surface (replaces "always on" heat sources)
+        let inject = params.fuelInject * logSurfaceZone * (0.55 + 0.45 * crack_mask) * dt;
+        fuel = clamp(fuel + inject, 0.0, 1.0);
+
+        let fuelAvailability = logSurfaceZone * fuel;
+        let combustionShape = smoothstep(-0.2, 0.8, n_val);
+
+      // Pilot heat: lets ignition bootstrap from a cold start.
+      temp += params.emission * combustionShape * logSurfaceZone * dt * 0.22;
+        let ignite = smoothstep(params.T_ignite, params.T_burn, temp);
+        let combustionIntensity = combustionShape * fuelAvailability * localOxygen * ignite;
+
+        // Reaction proxy R: drives heat, soot generation, and fuel consumption
+        let R = combustionIntensity * params.burnRate;
+        fuel = max(0.0, fuel - R * dt);
+
+        temp += R * params.heatYield * dt;
+
+        // Soot yield: higher when oxygen is low and temperature is moderate.
+        let hot = smoothstep(params.T_ignite, params.T_burn, temp);
+        let smolder = 1.0 - localOxygen;
+        let sootYield = mix(params.sootYieldSmolder, params.sootYieldFlame, hot) * (0.4 + 0.6 * smolder);
+        soot += R * sootYield * dt;
+
+        let intensity = R * (0.55 + 0.45 * crack_mask);
          let logNorm = get_wood_normal(uvw);
          newVel += normalize(logNorm * 0.35 + vec3f(0.0, 2.5, 0.0)) * intensity * 160.0 * dt;
      }
   } else {
      let d_emit = length(uvw - vec3f(0.5, 0.2, 0.5));
      if (d_emit < 0.05) {
-        temp += params.emission * dt * 8.0;
-        newVel += vec3f(0.0, 0.8, 0.0) * params.emission * dt;
+        let inject = params.fuelInject * dt * 2.0;
+        fuel = clamp(fuel + inject, 0.0, 1.0);
+
+        // Pilot heat for point-source scenes.
+        temp += params.emission * dt * 2.0;
+        let ignite = smoothstep(params.T_ignite, params.T_burn, temp);
+        let R = ignite * localOxygen * fuel * params.burnRate * 0.45;
+        fuel = max(0.0, fuel - R * dt);
+        temp += R * params.heatYield * dt;
+        soot += R * params.sootYieldFlame * dt;
+        newVel += vec3f(0.0, 0.8, 0.0) * R * dt;
      }
   }
 
@@ -497,12 +622,16 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
       temp *= (1.0 - friction * 0.015);
   }
 
-  let b_dist = min(min(uvw.x, 1.0 - uvw.x), min(min(uvw.y, 1.0 - uvw.y), min(uvw.z, 1.0 - uvw.z)));
-  let edge_damp = smoothstep(0.0, 0.06, b_dist);
-  temp *= edge_damp; matter *= edge_damp; newVel *= edge_damp;
+  // Boundary damping: keep floor and side walls stable, but avoid a hard “ceiling”
+  // that artificially chops the plume height.
+  let b_dist_xz = min(min(uvw.x, 1.0 - uvw.x), min(uvw.z, 1.0 - uvw.z));
+  let b_dist = min(b_dist_xz, uvw.y);
+  let edge_damp = smoothstep(0.0, 0.02, b_dist);
+  temp *= edge_damp; soot *= edge_damp; fuel *= edge_damp; newVel *= edge_damp;
 
   densityOut[idx] = temp;
-  velocityOut[idx] = vec4f(clamp(newVel, vec3f(-120.0), vec3f(120.0)), matter);
+  velocityOut[idx] = vec4f(clamp(newVel, vec3f(-120.0), vec3f(120.0)), soot);
+  fuelOut[idx] = fuel;
 }
 `;
 
@@ -512,6 +641,7 @@ ${WOOD_SDF_FN}
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var<storage, read> densityIn: array<f32>;
 @group(0) @binding(2) var<storage, read> velocityIn: array<vec4f>;
+@group(0) @binding(3) var<storage, read> fuelIn: array<f32>;
 
 struct VertexOutput { @builtin(position) Position : vec4f, @location(0) uv : vec2f };
 
@@ -527,11 +657,21 @@ fn get_idx(p: vec3i) -> u32 {
   return u32(cp.z * d * d + cp.y * d + cp.x);
 }
 
-fn sample_volume(pos: vec3f) -> vec2f {
+fn inside_volume_world(p: vec3f) -> bool {
+  return p.x >= 0.0 && p.x <= 1.0 && p.z >= 0.0 && p.z <= 1.0 && p.y >= 0.0 && p.y <= params.volumeHeight;
+}
+
+fn to_volume_uv(p: vec3f) -> vec3f {
+  let h = max(0.0001, params.volumeHeight);
+  return vec3f(p.x, clamp(p.y / h, 0.0, 1.0), p.z);
+}
+
+fn sample_volume(pos: vec3f) -> vec3f {
   let d = params.dim; let p = pos * d - 0.5; let i = vec3i(floor(p)); let f = fract(p);
   let f_res = mix(mix(mix(densityIn[get_idx(i)], densityIn[get_idx(i + vec3i(1,0,0))], f.x), mix(densityIn[get_idx(i + vec3i(0,1,0))], densityIn[get_idx(i + vec3i(1,1,0))], f.x), f.y), mix(mix(densityIn[get_idx(i + vec3i(0,0,1))], densityIn[get_idx(i + vec3i(1,0,1))], f.x), mix(densityIn[get_idx(i + vec3i(0,1,1))], densityIn[get_idx(i + vec3i(1,1,1))], f.x), f.y), f.z);
   let s_res = mix(mix(mix(velocityIn[get_idx(i)].w, velocityIn[get_idx(i + vec3i(1,0,0))].w, f.x), mix(velocityIn[get_idx(i + vec3i(0,1,0))].w, velocityIn[get_idx(i + vec3i(1,1,0))].w, f.x), f.y), mix(mix(velocityIn[get_idx(i + vec3i(0,0,1))].w, velocityIn[get_idx(i + vec3i(1,0,1))].w, f.x), mix(velocityIn[get_idx(i + vec3i(0,1,1))].w, velocityIn[get_idx(i + vec3i(1,1,1))].w, f.x), f.y), f.z);
-  return vec2f(f_res, s_res);
+  let fu_res = mix(mix(mix(fuelIn[get_idx(i)], fuelIn[get_idx(i + vec3i(1,0,0))], f.x), mix(fuelIn[get_idx(i + vec3i(0,1,0))], fuelIn[get_idx(i + vec3i(1,1,0))], f.x), f.y), mix(mix(fuelIn[get_idx(i + vec3i(0,0,1))], fuelIn[get_idx(i + vec3i(1,0,1))], f.x), mix(fuelIn[get_idx(i + vec3i(0,1,1))], fuelIn[get_idx(i + vec3i(1,1,1))], f.x), f.y), f.z);
+  return vec3f(f_res, s_res, fu_res);
 }
 
 fn compute_reaction(pos: vec3f) -> f32 {
@@ -548,12 +688,13 @@ fn compute_reaction(pos: vec3f) -> f32 {
   let grad = vec3f(txp - txn, typ - tyn, tzp - tzn);
   let gradMag = length(grad) * 0.5;
 
-  let tempGate = smoothstep(0.18, 0.55, temp);
+  let tempGate = smoothstep(params.T_ignite, params.T_burn, temp);
 
   // Sharpen the reaction front so emission collapses into sheets/tongues.
   let front = smoothstep(0.035, 0.055, gradMag);
   let r = tempGate * front;
-  return pow(clamp(r, 0.0, 1.0), 4.0);
+  let sharp = max(1.0, params.flameSharpness);
+  return pow(clamp(r, 0.0, 1.0), sharp);
 }
 
 fn tonemap_aces(color: vec3f) -> vec3f {
@@ -579,14 +720,40 @@ fn getBlackbodyColor(temp: f32) -> vec3f {
 }
 
 fn get_light_transmittance(pos: vec3f, lightDir: vec3f) -> f32 {
-    var p = pos; let step = 0.045; var densitySum = 0.0;
+  var p = pos;
+  let step = 0.045;
+  var tau = 0.0;
     for(var i=0; i<12; i++) {
-        p += lightDir * step; if (p.x < 0.0 || p.x > 1.0 || p.y > 1.0 || p.z < 0.0 || p.z > 1.0 || p.y < 0.0) { break; }
-    let val = sample_volume(p);
-    // Extinction is smoke/soot only. Hot gas does not absorb by itself.
-    densitySum += val.y * params.absorption;
+        p += lightDir * step;
+        if (!inside_volume_world(p)) { break; }
+  let uv = to_volume_uv(p);
+  let val = sample_volume(uv);
+  let soot = val.y;
+  let temp = val.x;
+  // Smoke taxonomy (minimum viable realism):
+  // - soot: dark, absorption-dominant, reduced near hottest flame but not removed
+  // - haze: scattering-dominant, appears as soot cools (mid/far plume)
+  let hot = smoothstep(0.35, 0.7, temp);
+  let cool = smoothstep(params.T_hazeStart, params.T_hazeFull, 1.0 - temp);
+  let height = smoothstep(0.22, 0.92, uv.y);
+
+  let sootVis = mix(1.0, 0.25, hot);
+  let sootRaw = soot * sootVis;
+  let hazeRaw = soot * cool * height;
+
+  let sootOpt = 1.0 - exp(-sootRaw * 0.10);
+  let hazeOpt = 1.0 - exp(-hazeRaw * 0.04);
+
+  let thickness = max(0.0, params.smokeThickness);
+  let darkness = clamp(params.smokeDarkness, 0.0, 1.0);
+  let absorption = params.absorption * thickness * (0.65 + 0.7 * darkness);
+  let scattering = params.scattering * thickness * (0.85 - 0.55 * darkness);
+
+  let sigmaA = sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12;
+  let sigmaS = sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55;
+  tau += (sigmaA + sigmaS) * step;
     }
-    return exp(-densitySum * step * 18.0);
+  return exp(-tau);
 }
 
 // HEMISPHERE GI - Sample upward in multiple directions to find actual fire
@@ -615,22 +782,42 @@ fn get_volume_lighting(pos: vec3f) -> vec3f {
             let p = pos + dir * t;
 
             // Stop if outside volume
-            if (any(p < vec3f(0.0)) || any(p > vec3f(1.0))) { break; }
+          if (!inside_volume_world(p)) { break; }
             if (transmittance < 0.02) { break; }
 
-            let val = sample_volume(p);
+          let uv = to_volume_uv(p);
+          let val = sample_volume(uv);
 
-            let reaction = compute_reaction(p);
+            let fuel = val.z;
+            var reaction = compute_reaction(uv);
+            let fuelGate = 0.25 + 0.75 * smoothstep(0.0, 0.10, fuel);
+            reaction *= fuelGate;
 
             // Fire emits light downward to floor
             if (reaction > 0.01) {
-              let emission = getBlackbodyColor(val.x * params.emission * 0.3) * reaction;
+              let emission = getBlackbodyColor(val.x) * (params.emission * 0.12) * reaction;
                 let atten = 1.0 / (1.0 + t * t * 5.0);
               totalLight += emission * atten * transmittance * 0.12;
             }
 
             // Smoke blocks light
-            transmittance *= exp(-(val.y * params.absorption) * 0.06 * 0.3);
+            let soot = val.y;
+            let temp = val.x;
+            let hot = smoothstep(0.35, 0.7, temp);
+            let cool = smoothstep(params.T_hazeStart, params.T_hazeFull, 1.0 - temp);
+            let height = smoothstep(0.22, 0.92, uv.y);
+            let sootVis = mix(1.0, 0.25, hot);
+            let sootRaw = soot * sootVis;
+            let hazeRaw = soot * cool * height;
+            let sootOpt = 1.0 - exp(-sootRaw * 0.10);
+            let hazeOpt = 1.0 - exp(-hazeRaw * 0.04);
+            let thickness = max(0.0, params.smokeThickness);
+            let darkness = clamp(params.smokeDarkness, 0.0, 1.0);
+            let absorption = params.absorption * thickness * (0.65 + 0.7 * darkness);
+            let scattering = params.scattering * thickness * (0.85 - 0.55 * darkness);
+            let sigmaA = sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12;
+            let sigmaS = sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55;
+            transmittance *= exp(-(sigmaA + sigmaS) * 0.06 * 0.3);
 
             t += 0.06;
         }
@@ -675,7 +862,7 @@ fn get_floor_material(p: vec3f) -> vec3f {
   let right = normalize(cross(vec3f(0.0, 1.0, 0.0), fwd)); let up = cross(fwd, right);
   let rd = normalize(fwd + right * (in.uv.x - 0.5) * 2.0 + up * (in.uv.y - 0.5) * 2.0);
   let jitter = fract(sin(dot(in.uv + fract(params.time * 0.05), vec2f(12.9898, 78.233))) * 43758.5453);
-  let t = intersectAABB(ro, rd, vec3f(0.0), vec3f(1.0));
+  let t = intersectAABB(ro, rd, vec3f(0.0), vec3f(1.0, params.volumeHeight, 1.0));
 
   let lightDir = normalize(vec3f(0.3, 1.0, 0.4));
   var bgCol = vec3f(0.22, 0.22, 0.24); // Medium gray background
@@ -750,29 +937,61 @@ fn get_floor_material(p: vec3f) -> vec3f {
   let baseSteps = 240;
   let steps = i32(f32(baseSteps) * params.stepQuality);
   let stepSize = (tVolumeFar - tNear) / f32(steps); var pos = ro + rd * (tNear + stepSize * jitter);
-  var accumCol = vec3f(0.0); var transmittance = 1.0; let phaseSun = phase_function(dot(rd, lightDir), 0.85);
+  var accumCol = vec3f(0.0); var transmittance = 1.0; let phaseSun = phase_function(dot(rd, lightDir), params.anisotropyG);
 
   for (var i = 0; i < steps; i++) {
       if (transmittance < 0.005) { break; }
-      if (all(pos >= vec3f(0.0)) && all(pos <= vec3f(1.0))) {
-           let val = sample_volume(pos);
-         let soot = val.y;
-         let reaction = compute_reaction(pos);
-         if (soot > 0.0001 || reaction > 0.0001) {
-           let sunTrans = get_light_transmittance(pos, lightDir);
-           let scatter = vec3f(12.0) * sunTrans * phaseSun * mix(vec3f(0.6, 0.65, 0.7), vec3f(0.2, 0.18, 0.15), clamp(soot * 1.8 * 1.2, 0.0, 1.0)) * params.scattering;
+     if (inside_volume_world(pos)) {
+       let uv = to_volume_uv(pos);
+       let val = sample_volume(uv);
+           let soot = val.y;
+           let temp = val.x;
+           let fuel = val.z;
+       var reaction = compute_reaction(uv);
+           let fuelGate = 0.25 + 0.75 * smoothstep(0.0, 0.10, fuel);
+           reaction *= fuelGate;
 
-           // Flame-only emission: reaction emits, soot absorbs.
-           let emission = getBlackbodyColor(val.x * params.emission) * reaction;
+           // Smoke taxonomy (minimum viable realism):
+           // - soot: dark/absorbing, reduced near hottest flame but not removed
+           // - haze: scattering-dominant, appears as soot cools (mid/far plume)
+           let hot = smoothstep(0.35, 0.7, temp);
+           let cool = smoothstep(params.T_hazeStart, params.T_hazeFull, 1.0 - temp);
+           let height = smoothstep(0.22, 0.92, uv.y);
+           let sootVis = mix(1.0, 0.25, hot);
+           let sootRaw = soot * sootVis;
+           let hazeRaw = soot * cool * height;
+           let sootOpt = 1.0 - exp(-sootRaw * 0.10);
+           let hazeOpt = 1.0 - exp(-hazeRaw * 0.04);
 
-           let extinction = soot * params.absorption * 22.0;
-           let stepTrans = exp(-(extinction) * stepSize);
+           if ((sootOpt + hazeOpt) > 0.0001 || reaction > 0.0001) {
+               // Absorption/scattering split: soot absorbs, haze scatters.
+               let thickness = max(0.0, params.smokeThickness);
+               let darkness = clamp(params.smokeDarkness, 0.0, 1.0);
+               let absorption = params.absorption * thickness * (0.65 + 0.7 * darkness);
+               let scattering = params.scattering * thickness * (0.85 - 0.55 * darkness);
 
-           // In-scattering scales with extinction, emission integrates along the ray.
-           accumCol += scatter * (1.0 - stepTrans) * transmittance;
-           accumCol += emission * transmittance * stepSize;
-           transmittance *= stepTrans;
-         }
+               let sigmaA = sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12;
+               let sigmaS = sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55;
+               let sigmaT = sigmaA + sigmaS;
+               let stepTrans = exp(-sigmaT * stepSize);
+
+               let sunTrans = get_light_transmittance(pos, lightDir);
+               let sootTint = vec3f(0.10, 0.09, 0.085);
+               let hazeTint = vec3f(0.18, 0.18, 0.19);
+               let sootFrac = clamp(sootOpt / max(1e-6, sootOpt + hazeOpt), 0.0, 1.0);
+               let smokeTint = mix(hazeTint, sootTint, sootFrac);
+               let scatterRadiance = vec3f(9.0) * sunTrans * phaseSun * smokeTint;
+               let scatterWeight = (sigmaS / max(1e-6, sigmaT)) * (1.0 - stepTrans);
+               accumCol += scatterRadiance * scatterWeight * transmittance;
+
+               // Flame-only emission: reaction emits, soot only attenuates.
+               // Apply a *soft* self-shadow (don't zero out emission inside smoke).
+               let shadowTr = max(0.35, mix(1.0, sunTrans, 0.35));
+               let emission = getBlackbodyColor(temp) * params.emission * reaction * shadowTr;
+               accumCol += emission * transmittance * stepSize;
+
+               transmittance *= stepTrans;
+           }
       }
       pos += rd * stepSize;
   }
@@ -850,7 +1069,7 @@ const PARAM_GROUP_LABELS: Record<ParamGroup, string> = {
 };
 
 const PARAM_SPECS: ParameterSpec[] = [
-  { key: 'buoyancy', label: 'Buoyancy', group: 'fluid', min: 0, max: 25, step: 0.1, unit: 'm/s^2*', hint: 'Upward thermal lift coefficient.' },
+  { key: 'buoyancy', label: 'Buoyancy', group: 'fluid', min: 0, max: 40, step: 0.1, unit: 'm/s^2*', hint: 'Upward thermal lift coefficient.' },
   { key: 'dissipation', label: 'Heat Decay', group: 'fluid', min: 0.9, max: 0.999, step: 0.001, unit: 'ratio/frame', hint: 'Temperature retention per frame.' },
   { key: 'vorticity', label: 'Vorticity', group: 'fluid', min: 0, max: 60, step: 0.1, unit: '1/s*', hint: 'Rotational energy injection.' },
   { key: 'plumeTurbulence', label: 'Plume Turbulence', group: 'fluid', min: 0, max: 20, step: 0.01, unit: 'coef', hint: 'Small-scale breakup intensity.' },
@@ -983,6 +1202,14 @@ const FluidSimulation: React.FC = () => {
   const [lockedParams, setLockedParams] = useState<Record<EditableParamKey, boolean>>(() => (
     Object.fromEntries(PARAM_SPECS.map((spec) => [spec.key, false])) as Record<EditableParamKey, boolean>
   ));
+
+  const deriveSmokeAmountT = (params: Pick<SimParamState, 'smokeDissipation'>) => clamp(inverseLerp(0.85, 0.995, params.smokeDissipation), 0, 1);
+  const deriveTurbulenceCharacterT = (params: Pick<SimParamState, 'plumeTurbulence'>) => clamp(inverseLerp(0.1, 14, params.plumeTurbulence), 0, 1);
+
+  const [tuningMacroKnobs, setTuningMacroKnobs] = useState(() => ({
+    smokeAmount: deriveSmokeAmountT(INITIAL_PARAMS),
+    turbulenceCharacter: deriveTurbulenceCharacterT(INITIAL_PARAMS),
+  }));
   const cameraRef = useRef({ theta: 1.625, phi: 1.35, radius: 1.25, target: [0.5, 0.4, 0.5] as [number, number, number], pos: [0.45, 0.38, 1.3] as [number, number, number] });
   const interactionRef = useRef({ isDragging: false, lastX: 0, lastY: 0, button: 0 });
   const paramsRef = useRef(simParams);
@@ -1005,6 +1232,15 @@ const FluidSimulation: React.FC = () => {
     timelineIdRef.current += 1;
     setTimeline((prev) => [item, ...prev].slice(0, 60));
   }, []);
+
+  const copyText = useCallback(async (text: string, successMessage: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      pushTimeline(successMessage);
+    } catch {
+      setRuntimeWarning('Clipboard copy failed (permission denied).');
+    }
+  }, [pushTimeline]);
 
   useEffect(() => {
     const handleResize = () => setDimensions({ width: window.innerWidth, height: window.innerHeight });
@@ -1039,6 +1275,11 @@ const FluidSimulation: React.FC = () => {
     setSelectedSceneId(id);
     const scene = SCENES.find(s => s.id === id);
     if (scene) {
+      setTuningMacroKnobs((prev) => ({
+        ...prev,
+        smokeAmount: deriveSmokeAmountT(scene.params),
+        turbulenceCharacter: deriveTurbulenceCharacterT(scene.params),
+      }));
       setSimParams((prev) => ({
         ...prev,
         ...scene.params,
@@ -1052,6 +1293,11 @@ const FluidSimulation: React.FC = () => {
 
   const resetPreset = useCallback(() => {
     const scene = SCENES.find((entry) => entry.id === selectedSceneId) ?? SCENES[0];
+    setTuningMacroKnobs((prev) => ({
+      ...prev,
+      smokeAmount: deriveSmokeAmountT(scene.params),
+      turbulenceCharacter: deriveTurbulenceCharacterT(scene.params),
+    }));
     setSimParams((prev) => ({
       ...prev,
       ...scene.params,
@@ -1107,7 +1353,8 @@ const FluidSimulation: React.FC = () => {
         assign('fuelEfficiency', lerp(0.7, 3.0, t));
       } else if (id === 'smokeDensity') {
         assign('smokeWeight', lerp(-3, 12, t));
-        assign('smokeDissipation', lerp(0.995, 0.9, t));
+        // Higher values keep matter around longer (more visible smoke).
+        assign('smokeDissipation', lerp(0.85, 0.995, t));
         assign('absorption', lerp(4, 65, t));
         assign('scattering', lerp(2, 20, t));
       } else if (id === 'convectionScale') {
@@ -1254,6 +1501,24 @@ const FluidSimulation: React.FC = () => {
     link.click();
   };
 
+  const copyParamsToClipboard = useCallback(() => {
+    const payload = {
+      schema: 'firesim-params.v1',
+      copiedAt: new Date().toISOString(),
+      sceneId: selectedSceneId,
+      gridSize,
+      smokeEnabled: isSmokeEnabled,
+      qualityMode,
+      params: { ...simParams, timeStep: DEFAULT_TIME_STEP },
+    };
+    void copyText(JSON.stringify(payload, null, 2), 'Copied params JSON');
+  }, [copyText, gridSize, isSmokeEnabled, qualityMode, selectedSceneId, simParams]);
+
+  const copyAlgorithmToClipboard = useCallback(() => {
+    const payload = `// firesim algorithm (WGSL)\n// copiedAt: ${new Date().toISOString()}\n\n// === COMPUTE_SHADER ===\n${COMPUTE_SHADER}\n\n// === RENDER_SHADER ===\n${RENDER_SHADER}\n`;
+    void copyText(payload, 'Copied algorithm (WGSL)');
+  }, [copyText]);
+
   const savePresetToDisk = () => {
     downloadJson(`firesim-preset-${Date.now()}.json`, {
       schema: 'firesim-preset.v1',
@@ -1278,6 +1543,13 @@ const FluidSimulation: React.FC = () => {
       const nextParams = (parsed.params && typeof parsed.params === 'object'
         ? parsed.params
         : parsed) as Partial<SimParamState>;
+
+      const mergedPreview = { ...simParams, ...nextParams } as SimParamState;
+      setTuningMacroKnobs((prev) => ({
+        ...prev,
+        smokeAmount: deriveSmokeAmountT(mergedPreview),
+        turbulenceCharacter: deriveTurbulenceCharacterT(mergedPreview),
+      }));
 
       setSimParams((prev) => ({
         ...prev,
@@ -1398,7 +1670,7 @@ const FluidSimulation: React.FC = () => {
   const tempC = Math.round(simParams.emission * 120 + simParams.buoyancy * 60 + simParams.vorticity * 10);
   const fuelPct = Math.round(clamp(100 - simParams.emission * 2.6, 0, 100));
   const simTimeSeconds = stats.frame * DEFAULT_TIME_STEP;
-  const smokeAmount = Math.round((1 - simParams.smokeDissipation) * 1000 + simParams.scattering * 3.8);
+  const smokeAmount = Math.round(clamp(inverseLerp(0.85, 0.995, simParams.smokeDissipation), 0, 1) * 1000 + simParams.scattering * 3.8);
   const smokeDarkness = clamp(simParams.absorption / 150, 0, 1);
   const turbulenceCharacter = clamp(inverseLerp(0.1, 14, simParams.plumeTurbulence) * 1.05, 0, 1);
   const windGusts = Math.round(simParams.turbSpeed * 6);
@@ -1423,9 +1695,17 @@ const FluidSimulation: React.FC = () => {
         low: 'Low',
         high: 'High',
         tone: 'warm' as const,
-        value: clamp(inverseLerp(0.5, 8.0, simParams.buoyancy), 0, 1),
-        valueText: undefined,
-        onChange: (t: number) => updateParam('buoyancy', lerp(0.5, 8.0, t)),
+        value: clamp(inverseLerp(0.5, 40.0, simParams.buoyancy), 0, 1),
+        valueText: `${simParams.buoyancy.toFixed(2)} m/s²`,
+        onChange: (t: number) => {
+          updateParam('buoyancy', lerp(0.5, 40.0, t));
+          // Sustain lift over height: keep heat from collapsing and reduce drag.
+          updateParam('dissipation', lerp(0.88, 0.995, t));
+          // Keep a small amount of drag at high lift to avoid runaway velocities
+          // that can destabilize advection and "blow out" the flame.
+          updateParam('drag', lerp(0.08, 0.015, t));
+          updateParam('heatDiffusion', lerp(0.12, 0.0, t));
+        },
       },
       (isAll || isFlame) && {
         id: 'flameIntensity',
@@ -1453,9 +1733,12 @@ const FluidSimulation: React.FC = () => {
         low: 'Sparse',
         high: 'Heavy',
         tone: 'mono' as const,
-        value: clamp(inverseLerp(0.995, 0.85, simParams.smokeDissipation), 0, 1),
+        value: tuningMacroKnobs.smokeAmount,
         valueText: `${smokeAmount} kg/m³`,
-        onChange: (t: number) => applyMacro('smokeDensity', t),
+        onChange: (t: number) => {
+          setTuningMacroKnobs((prev) => ({ ...prev, smokeAmount: t }));
+          applyMacro('smokeDensity', t);
+        },
       },
       (isAll || isSmoke) && {
         id: 'smokeDarkness',
@@ -1473,9 +1756,12 @@ const FluidSimulation: React.FC = () => {
         low: 'Laminar',
         high: 'Chaotic',
         tone: 'warm' as const,
-        value: turbulenceCharacter,
+        value: tuningMacroKnobs.turbulenceCharacter,
         valueText: `${turbulenceCharacter.toFixed(2)}`,
-        onChange: (t: number) => applyMacro('turbulenceCharacter', t),
+        onChange: (t: number) => {
+          setTuningMacroKnobs((prev) => ({ ...prev, turbulenceCharacter: t }));
+          applyMacro('turbulenceCharacter', t);
+        },
       },
       (isAll || isConvection) && {
         id: 'windGusts',
@@ -1507,7 +1793,7 @@ const FluidSimulation: React.FC = () => {
       valueText?: string;
       onChange: (t: number) => void;
     }>;
-  }, [applyMacro, deckRailSection, simParams, smokeAmount, smokeDarkness, turbulenceCharacter, updateParam, windGusts, burnRate]);
+  }, [applyMacro, deckRailSection, simParams, smokeAmount, smokeDarkness, turbulenceCharacter, tuningMacroKnobs, updateParam, windGusts, burnRate]);
 
   return (
     <div className="deck-root">
@@ -1581,6 +1867,12 @@ const FluidSimulation: React.FC = () => {
             onClick={() => setIsSmokeEnabled((prev) => !prev)}
           >
             <Droplet size={16} />
+          </button>
+          <button type="button" className="deck-tool" aria-label="Copy params" onClick={copyParamsToClipboard}>
+            <Copy size={16} />
+          </button>
+          <button type="button" className="deck-tool" aria-label="Copy algorithm" onClick={copyAlgorithmToClipboard}>
+            <Zap size={16} />
           </button>
           <button type="button" className="deck-tool" aria-label="Capture" onClick={captureFrame}><Camera size={16} /></button>
 
@@ -1960,7 +2252,7 @@ const ParameterRow: React.FC<{
           className={`sim-param-button ${locked ? 'is-active' : ''}`}
           onClick={onToggleLock}
           aria-label={locked ? `Unlock ${spec.label}` : `Lock ${spec.label}`}
-          title={`Default ${formatWithStep(defaultValue, spec.step)}`}
+          data-tooltip={`${locked ? 'Unlock' : 'Lock'} ${spec.label}\nDefault ${formatWithStep(defaultValue, spec.step)}`}
         >
           {locked ? <Lock size={12} /> : <LockOpen size={12} />}
         </button>
