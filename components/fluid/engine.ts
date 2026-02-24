@@ -38,6 +38,7 @@ export interface SimulationParams {
   smokeDarkness?: number;
   flameSharpness?: number;
   sootDissipation?: number;
+  volumeHeight?: number;
 }
 
 export interface ScenePreset {
@@ -67,7 +68,7 @@ export const sanitizeSimParams = (params: SimulationParams): SimulationParams =>
     absorption: finiteOrDefault(params.absorption, 1),
     smokeWeight: finiteOrDefault(params.smokeWeight, 0),
     plumeTurbulence: finiteOrDefault(params.plumeTurbulence, 1),
-    smokeDissipation: finiteOrDefault(params.smokeDissipation, 0.95),
+    smokeDissipation: finiteOrDefault(params.smokeDissipation, 0.985),
     windX: finiteOrDefault(params.windX, 0),
     windZ: finiteOrDefault(params.windZ, 0),
     turbFreq: finiteOrDefault(params.turbFreq, 28),
@@ -297,12 +298,12 @@ export class FluidTransport {
     view.setFloat32(64, camera.pos[0], true);
     view.setFloat32(68, camera.pos[1], true);
     view.setFloat32(72, camera.pos[2], true);
-    view.setFloat32(76, 0, true); // pad2
+    view.setFloat32(76, 0, true); // cameraPos.w
 
     view.setFloat32(80, camera.target[0], true);
     view.setFloat32(84, camera.target[1], true);
     view.setFloat32(88, camera.target[2], true);
-    view.setFloat32(92, 0, true); // pad3
+    view.setFloat32(92, 0, true); // targetPos.w
 
     view.setFloat32(96, safeParams.windX, true);
     view.setFloat32(100, safeParams.windZ, true);
@@ -325,8 +326,8 @@ export class FluidTransport {
     view.setFloat32(140, derivedFuelInject, true);
 
     view.setFloat32(144, (safeParams as any).heatYield ?? 3.4, true);
-    view.setFloat32(148, (safeParams as any).sootYieldFlame ?? 0.22, true);
-    view.setFloat32(152, (safeParams as any).sootYieldSmolder ?? 0.55, true);
+    view.setFloat32(148, (safeParams as any).sootYieldFlame ?? 0.55, true);
+    view.setFloat32(152, (safeParams as any).sootYieldSmolder ?? 1.1, true);
     view.setFloat32(156, (safeParams as any).hazeConvertRate ?? 0.0, true);
 
     view.setFloat32(160, (safeParams as any).T_hazeStart ?? 0.35, true);
@@ -371,11 +372,10 @@ struct SimParams {
   plumeTurbulence: f32,
   smokeDissipation: f32,
 
-  cameraPos: vec3f,
-  pad2: f32,
-
-  targetPos: vec3f,
-  pad3: f32,
+  // Use vec4 slots to avoid implicit std140-style padding traps for vec3.
+  // xyz used; w unused.
+  cameraPos: vec4f,
+  targetPos: vec4f,
 
   windX: f32,
   windZ: f32,
@@ -643,7 +643,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let insulation = mix(params.dissipation, 1.0, insulation_factor * 0.88);
   temp *= insulation;
 
-  soot *= params.sootDissipation;
+  soot *= clamp(params.smokeDissipation, 0.0, 1.0);
 
   let buoyancyDir = vec3f(0.0, 1.0, 0.0);
   let thermalLift = max(0.0, (pow(temp, 1.25) * 0.4) - (soot * params.smokeWeight * 0.0018));
@@ -721,12 +721,23 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
       temp *= (1.0 - friction * 0.015);
   }
 
-  // Boundary damping: keep floor and side walls stable, but avoid a hard “ceiling”
-  // that artificially chops the plume height.
+  // Boundary damping: keep velocity stable near floor + side walls,
+  // but do NOT erase soot/fuel at the floor (it is born near y≈0).
   let b_dist_xz = min(min(uvw.x, 1.0 - uvw.x), min(uvw.z, 1.0 - uvw.z));
-  let b_dist = min(b_dist_xz, uvw.y);
-  let edge_damp = smoothstep(0.0, 0.02, b_dist);
-  temp *= edge_damp; soot *= edge_damp; fuel *= edge_damp; newVel *= edge_damp;
+  let floor_dist = uvw.y;
+
+  // Velocity: damp near all boundaries.
+  let damp_vel = smoothstep(0.0, 0.02, min(b_dist_xz, floor_dist));
+  newVel *= damp_vel;
+
+  // Temperature: mild damping near floor + walls (avoid sticky heat at boundaries).
+  let damp_temp = smoothstep(0.0, 0.01, floor_dist) * smoothstep(0.0, 0.02, b_dist_xz);
+  temp *= damp_temp;
+
+  // Species: only damp near side walls.
+  let damp_species = smoothstep(0.0, 0.02, b_dist_xz);
+  soot *= damp_species;
+  fuel *= damp_species;
   temp = max(temp, 0.0);
   soot = max(soot, 0.0);
   fuel = max(fuel, 0.0);
@@ -776,10 +787,31 @@ fn sample_volume(pos: vec3f) -> vec3f {
   return vec3f(f_res, s_res, fu_res);
 }
 
-fn compute_reaction(pos: vec3f) -> f32 {
+fn sample_velocity_nearest(pos: vec3f) -> vec3f {
+  // Nearest-voxel velocity fetch (much cheaper than tri-linear).
+  let d = params.dim;
+  let p = pos * d - 0.5;
+  let i = vec3i(floor(p));
+  return velocityIn[get_idx(i)].xyz;
+}
+
+fn hash_vec3(p: vec3f) -> vec3f {
+  // Cheap hash (no trig) in [-1, 1]
+  var p3 = fract(p * vec3f(0.1031, 0.1030, 0.0973));
+  p3 += dot(p3, p3.yxz + 33.33);
+  return fract((p3.xxy + p3.yxx) * p3.zyx) * 2.0 - 1.0;
+}
+
+fn cheap_noise(p: vec3f) -> f32 {
+  return dot(hash_vec3(p), vec3f(0.3333333));
+}
+
+fn compute_reaction(pos: vec3f, temp: f32) -> f32 {
   // Flame lives on thin temperature edges, not in the hot volume.
   // reaction = smoothstep(T_ignite, T_hot, T) * smoothstep(g0, g1, |∇T|)
-  let temp = sample_volume(pos).x;
+  let tempGate = smoothstep(params.T_ignite, params.T_burn, temp);
+  if (tempGate < 0.001) { return 0.0; }
+
   let eps = 1.0 / params.dim;
   let txp = sample_volume(pos + vec3f(eps, 0.0, 0.0)).x;
   let txn = sample_volume(pos - vec3f(eps, 0.0, 0.0)).x;
@@ -789,8 +821,6 @@ fn compute_reaction(pos: vec3f) -> f32 {
   let tzn = sample_volume(pos - vec3f(0.0, 0.0, eps)).x;
   let grad = vec3f(txp - txn, typ - tyn, tzp - tzn);
   let gradMag = length(grad) * 0.5;
-
-  let tempGate = smoothstep(params.T_ignite, params.T_burn, temp);
 
   // Sharpen the reaction front so emission collapses into sheets/tongues.
   let front = smoothstep(0.035, 0.055, gradMag);
@@ -823,9 +853,9 @@ fn getBlackbodyColor(temp: f32) -> vec3f {
 
 fn get_light_transmittance(pos: vec3f, lightDir: vec3f) -> f32 {
   var p = pos;
-  let step = 0.045;
+  let step = 0.08;
   var tau = 0.0;
-    for(var i=0; i<12; i++) {
+    for(var i=0; i<6; i++) {
         p += lightDir * step;
         if (!inside_volume_world(p)) { break; }
     let uv = to_volume_uv(p);
@@ -843,10 +873,10 @@ fn get_light_transmittance(pos: vec3f, lightDir: vec3f) -> f32 {
     let sootRaw = soot * sootVis;
     let hazeRaw = soot * cool * height;
 
-    let sootOpt = 1.0 - exp(-sootRaw * 0.10);
-    let hazeOpt = 1.0 - exp(-hazeRaw * 0.04);
+    let sootOpt = 1.0 - exp(-sootRaw * 0.35);
+    let hazeOpt = 1.0 - exp(-hazeRaw * 0.12);
 
-    let thickness = max(0.0, params.smokeThickness);
+    let thickness = max(0.25, params.smokeThickness);
     let darkness = clamp(params.smokeDarkness, 0.0, 1.0);
     let absorption = params.absorption * thickness * (0.65 + 0.7 * darkness);
     let scattering = params.scattering * thickness * (0.85 - 0.55 * darkness);
@@ -864,23 +894,20 @@ fn get_volume_lighting(pos: vec3f) -> vec3f {
 
     // Sample directions in a hemisphere above the floor point
     // This finds light from wherever the fire actually IS
-    let dirs = array<vec3f, 6>(
+    let dirs = array<vec3f, 3>(
         vec3f(0.0, 1.0, 0.0),     // Straight up
-        vec3f(0.4, 0.9, 0.0),     // Forward-up
-        vec3f(-0.4, 0.9, 0.0),    // Back-up
-        vec3f(0.0, 0.9, 0.4),     // Right-up
-        vec3f(0.0, 0.9, -0.4),    // Left-up
-        vec3f(0.3, 0.95, 0.3)     // Diagonal
+        vec3f(0.5, 0.866, 0.0),   // Forward-up
+        vec3f(-0.5, 0.866, 0.0)   // Back-up
     );
 
-    for (var s = 0; s < 6; s++) {
+    for (var s = 0; s < 3; s++) {
         let dir = normalize(dirs[s]);
 
         // March upward from floor, find any fire along this direction
-        var t = 0.02;
+        var t = 0.05;
         var transmittance = 1.0;
 
-        for (var i = 0; i < 12; i++) {
+        for (var i = 0; i < 6; i++) {
             let p = pos + dir * t;
 
             // Stop if outside volume
@@ -891,7 +918,7 @@ fn get_volume_lighting(pos: vec3f) -> vec3f {
           let val = sample_volume(uv);
 
             let fuel = val.z;
-            var reaction = compute_reaction(uv);
+            var reaction = smoothstep(params.T_ignite, params.T_burn, val.x);
             let fuelGate = 0.25 + 0.75 * smoothstep(0.0, 0.10, fuel);
             reaction *= fuelGate;
 
@@ -899,7 +926,7 @@ fn get_volume_lighting(pos: vec3f) -> vec3f {
             if (reaction > 0.01) {
               let emission = getBlackbodyColor(val.x) * (params.emission * 0.12) * reaction;
                 let atten = 1.0 / (1.0 + t * t * 5.0);
-              totalLight += emission * atten * transmittance * 0.12;
+              totalLight += emission * atten * transmittance * 0.2;
             }
 
             // Smoke blocks light
@@ -911,21 +938,21 @@ fn get_volume_lighting(pos: vec3f) -> vec3f {
             let sootVis = mix(1.0, 0.25, hot);
             let sootRaw = soot * sootVis;
             let hazeRaw = soot * cool * height;
-            let sootOpt = 1.0 - exp(-sootRaw * 0.10);
-            let hazeOpt = 1.0 - exp(-hazeRaw * 0.04);
-            let thickness = max(0.0, params.smokeThickness);
+            let sootOpt = 1.0 - exp(-sootRaw * 0.35);
+            let hazeOpt = 1.0 - exp(-hazeRaw * 0.12);
+            let thickness = max(0.25, params.smokeThickness);
             let darkness = clamp(params.smokeDarkness, 0.0, 1.0);
             let absorption = params.absorption * thickness * (0.65 + 0.7 * darkness);
             let scattering = params.scattering * thickness * (0.85 - 0.55 * darkness);
             let sigmaA = sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12;
             let sigmaS = sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55;
-            transmittance *= exp(-(sigmaA + sigmaS) * 0.06 * 0.3);
+            transmittance *= exp(-(sigmaA + sigmaS) * 0.1 * 0.3);
 
-            t += 0.06;
+            t += 0.1;
         }
     }
 
-    return totalLight * 0.25;
+    return totalLight * 0.5;
 }
 
 fn intersectAABB(ro: vec3f, rd: vec3f, bmin: vec3f, bmax: vec3f) -> vec2f {
@@ -959,8 +986,24 @@ fn get_floor_material(p: vec3f) -> vec3f {
     return albedo * gi * 1.2 + ambient * albedo;
 }
 
+fn get_floor_material_fast(p: vec3f) -> vec3f {
+    // Cheaper fallback for large floor/background coverage.
+    let grid_size = 0.15;
+    let grid_line = 0.003;
+    let check = fract(p.xz / grid_size);
+    let line = smoothstep(grid_line, 0.0, check.x) + smoothstep(1.0-grid_line, 1.0, check.x) +
+               smoothstep(grid_line, 0.0, check.y) + smoothstep(1.0-grid_line, 1.0, check.y);
+
+    let dist = length(p.xz - 0.5);
+    let fade = smoothstep(5.0, 0.8, dist);
+    let albedo = mix(vec3f(0.85), vec3f(0.6), clamp(line, 0.0, 1.0) * fade);
+    let fireBounce = vec3f(0.22, 0.11, 0.05) * (params.emission * 0.02) / (1.0 + dist * dist * 18.0);
+    let ambient = vec3f(0.035);
+    return albedo * (ambient + fireBounce);
+}
+
 @fragment fn frag_main(in: VertexOutput) -> @location(0) vec4f {
-  let ro = params.cameraPos; let fwd = normalize(params.targetPos - ro);
+  let ro = params.cameraPos.xyz; let fwd = normalize(params.targetPos.xyz - ro);
   let right = normalize(cross(vec3f(0.0, 1.0, 0.0), fwd)); let up = cross(fwd, right);
   let rd = normalize(fwd + right * (in.uv.x - 0.5) * 2.0 + up * (in.uv.y - 0.5) * 2.0);
   let jitter = fract(sin(dot(in.uv + fract(params.time * 0.05), vec2f(12.9898, 78.233))) * 43758.5453);
@@ -969,17 +1012,17 @@ fn get_floor_material(p: vec3f) -> vec3f {
   let lightDir = normalize(vec3f(0.3, 1.0, 0.4));
   var bgCol = vec3f(0.22, 0.22, 0.24); // Medium gray background
 
-  // Calculate floor color once, used by both paths
   var floor_color = bgCol;
+  var t_floor = -1.0;
   if (rd.y < 0.0) {
-      let t_floor = -ro.y / rd.y;
-      if (t_floor > 0.0) {
-          floor_color = get_floor_material(ro + rd * t_floor);
-      }
+      t_floor = -ro.y / rd.y;
   }
 
   // Early exit if ray misses volume - just show floor/background
   if (t.x > t.y || t.y < 0.0) {
+    if (t_floor > 0.0) {
+        floor_color = get_floor_material_fast(ro + rd * t_floor);
+    }
     let mapped = tonemap_aces(floor_color * params.exposure);
     let safeGamma = max(params.gamma, 0.1);
     return vec4f(pow(mapped, vec3f(1.0 / safeGamma)), 1.0);
@@ -1037,20 +1080,35 @@ fn get_floor_material(p: vec3f) -> vec3f {
      }
   }
 
-  let baseSteps = 240;
+  if (!hasSolid && t_floor > 0.0) {
+      floor_color = get_floor_material_fast(ro + rd * t_floor);
+  }
+
+  let baseSteps = 160;
   let steps = max(1, i32(round(f32(baseSteps) * params.stepQuality)));
   let stepSize = max(1e-5, (tVolumeFar - tNear) / f32(steps)); var pos = ro + rd * (tNear + stepSize * jitter);
   var accumCol = vec3f(0.0); var transmittance = 1.0; let phaseSun = phase_function(dot(rd, lightDir), params.anisotropyG);
+  var cachedSunTrans = 1.0;
+  var shadowRefreshCountdown = 0;
 
   for (var i = 0; i < steps; i++) {
       if (transmittance < 0.005) { break; }
      if (inside_volume_world(pos)) {
-       let uv = to_volume_uv(pos);
-       let val = sample_volume(uv);
+         let uv = to_volume_uv(pos);
+         let val = sample_volume(uv);
            let soot = val.y;
            let temp = val.x;
            let fuel = val.z;
-       var reaction = compute_reaction(uv);
+       let baseReaction = smoothstep(params.T_ignite, params.T_burn, temp);
+       var reaction = baseReaction;
+           if (baseReaction > 0.0005) {
+               if (((i & 1) == 0) || baseReaction > 0.72) {
+                   reaction = compute_reaction(uv, temp);
+               } else {
+                   let approxSharp = max(1.0, params.flameSharpness * 0.4);
+                   reaction = pow(baseReaction, approxSharp);
+               }
+           }
            let fuelGate = 0.25 + 0.75 * smoothstep(0.0, 0.10, fuel);
            reaction *= fuelGate;
 
@@ -1063,22 +1121,45 @@ fn get_floor_material(p: vec3f) -> vec3f {
            let sootVis = mix(1.0, 0.25, hot);
            let sootRaw = soot * sootVis;
            let hazeRaw = soot * cool * height;
-           let sootOpt = 1.0 - exp(-sootRaw * 0.10);
-           let hazeOpt = 1.0 - exp(-hazeRaw * 0.04);
+           let sootOpt = 1.0 - exp(-sootRaw * 0.35);
+           let hazeOpt = 1.0 - exp(-hazeRaw * 0.12);
+           let activity = sootOpt + hazeOpt + reaction;
+           let emptyThreshold = 0.0012 / max(0.5, params.stepQuality);
+
+           if (activity < emptyThreshold) {
+             pos += rd * stepSize * 1.8;
+             continue;
+           }
 
            if ((sootOpt + hazeOpt) > 0.0001 || reaction > 0.0001) {
+             // Flow-locked micro detail (optimized): nearest velocity fetch + cheap hash noise.
+             let vel = sample_velocity_nearest(uv);
+             let velClamped = clamp(vel, vec3f(-60.0), vec3f(60.0));
+             let flowUv = uv - velClamped * 0.0006;
+             let detailFreq = 10.0 + params.turbFreq * 0.15;
+             let detail = clamp(cheap_noise(flowUv * detailFreq + vec3f(0.0, params.time * params.turbSpeed * 0.25, 0.0)), -1.0, 1.0);
+
              // Absorption/scattering split: soot absorbs, haze scatters.
-             let thickness = max(0.0, params.smokeThickness);
+             let thickness = max(0.25, params.smokeThickness);
              let darkness = clamp(params.smokeDarkness, 0.0, 1.0);
              let absorption = params.absorption * thickness * (0.65 + 0.7 * darkness);
              let scattering = params.scattering * thickness * (0.85 - 0.55 * darkness);
 
-             let sigmaA = sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12;
-             let sigmaS = sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55;
+               let microSmoke = clamp(1.0 + detail * 0.06, 0.85, 1.15);
+               let sigmaA = (sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12) * microSmoke;
+               let sigmaS = (sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55) * microSmoke;
              let sigmaT = sigmaA + sigmaS;
              let stepTrans = exp(-sigmaT * stepSize);
 
-             let sunTrans = get_light_transmittance(pos, lightDir);
+             if (shadowRefreshCountdown <= 0) {
+               cachedSunTrans = get_light_transmittance(pos, lightDir);
+               let denseMedium = reaction > 0.06 || sigmaT > 0.45;
+               shadowRefreshCountdown = select(2, 0, denseMedium);
+             } else {
+               shadowRefreshCountdown -= 1;
+             }
+
+             let sunTrans = cachedSunTrans;
              let sootTint = vec3f(0.10, 0.09, 0.085);
              let hazeTint = vec3f(0.18, 0.18, 0.19);
              let sootFrac = clamp(sootOpt / max(1e-6, sootOpt + hazeOpt), 0.0, 1.0);
@@ -1090,7 +1171,9 @@ fn get_floor_material(p: vec3f) -> vec3f {
              // Flame-only emission: reaction emits, soot only attenuates.
              // Apply a *soft* self-shadow (don't zero out emission inside smoke).
              let shadowTr = max(0.35, mix(1.0, sunTrans, 0.35));
-             let emission = getBlackbodyColor(temp) * params.emission * reaction * shadowTr;
+             let microFlame = clamp(1.0 + detail * 0.18, 0.7, 1.3);
+             let reactionEm = reaction * reaction;
+             let emission = getBlackbodyColor(temp) * params.emission * reactionEm * shadowTr * microFlame;
              accumCol += emission * transmittance * stepSize;
 
              transmittance *= stepTrans;
@@ -1108,11 +1191,11 @@ fn get_floor_material(p: vec3f) -> vec3f {
 `;
 
 export const SCENES: ScenePreset[] = [
-  { id: 0, name: 'Campfire', params: { vorticity: 3.4, dissipation: 0.936, buoyancy: 1.5, drag: 0.0, emission: 8.4, scattering: 2.9, absorption: 26.5, smokeWeight: -2.0, plumeTurbulence: 10.0, smokeDissipation: 0.92, exposure: 0.9, gamma: 2.2, windX: 0.0, windZ: 0.0, turbFreq: 28.0, turbSpeed: 1.0, fuelEfficiency: 1.0, heatDiffusion: 0.0, stepQuality: 1.0 } },
-  { id: 4, name: 'Wood Combustion', params: { vorticity: 2.2, dissipation: 0.903, buoyancy: 1.8, drag: 0.037, emission: 1.9, scattering: 6.5, absorption: 12.0, smokeWeight: 0.5, plumeTurbulence: 2.81, smokeDissipation: 0.85, windX: -0.05, windZ: 0.05, turbFreq: 15.0, turbSpeed: 2.5, fuelEfficiency: 1.5, heatDiffusion: 0.1, stepQuality: 1.0 } },
-  { id: 1, name: 'Candle', params: { vorticity: 3.5, dissipation: 0.92, buoyancy: 4.5, drag: 0.08, emission: 1.0, scattering: 2.5, absorption: 2.0, smokeWeight: 0.3, plumeTurbulence: 0.05, smokeDissipation: 0.985, windX: 0.0, windZ: 0.0, turbFreq: 45.0, turbSpeed: 0.2, fuelEfficiency: 0.5, heatDiffusion: 0.0, stepQuality: 1.5 } },
-  { id: 2, name: 'Dual Source', params: { vorticity: 15.0, dissipation: 0.985, buoyancy: 8.0, drag: 0.02, emission: 1.8, scattering: 4.5, absorption: 4.0, smokeWeight: 1.5, plumeTurbulence: 0.3, smokeDissipation: 0.992, windX: 0.2, windZ: 0.2, turbFreq: 20.0, turbSpeed: 1.5, fuelEfficiency: 1.0, heatDiffusion: 0.05, stepQuality: 1.0 } },
-  { id: 3, name: 'Firebending', params: { vorticity: 12.0, dissipation: 0.965, buoyancy: 5.0, drag: 0.002, emission: 3.0, scattering: 3.5, absorption: 1.5, smokeWeight: 0.5, plumeTurbulence: 0.8, smokeDissipation: 0.98, windX: 0.0, windZ: 0.0, turbFreq: 32.0, turbSpeed: 5.0, fuelEfficiency: 1.2, heatDiffusion: 0.0, stepQuality: 0.8 } },
-  { id: 5, name: 'Gas Explosion', params: { vorticity: 35.0, dissipation: 0.94, buoyancy: 16.0, drag: 0.01, emission: 6.0, scattering: 4.0, absorption: 1.0, smokeWeight: -0.5, plumeTurbulence: 1.5, smokeDissipation: 0.92, windX: 0.0, windZ: 0.0, turbFreq: 12.0, turbSpeed: 0.5, fuelEfficiency: 3.0, heatDiffusion: 0.2, stepQuality: 1.0 } },
-  { id: 6, name: 'Nuke', params: { vorticity: 50.0, dissipation: 0.998, buoyancy: 3.0, drag: 0.05, emission: 6.5, scattering: 8.0, absorption: 7.0, smokeWeight: 3.0, plumeTurbulence: 0.4, smokeDissipation: 0.999, windX: 0.0, windZ: 0.0, turbFreq: 8.0, turbSpeed: 0.1, fuelEfficiency: 5.0, heatDiffusion: 0.5, stepQuality: 1.2 } }
+  { id: 0, name: 'Campfire', params: { vorticity: 3.4, dissipation: 0.936, buoyancy: 1.5, drag: 0.0, emission: 8.4, scattering: 2.9, absorption: 26.5, smokeWeight: -2.0, plumeTurbulence: 10.0, smokeDissipation: 0.985, exposure: 0.9, gamma: 2.2, windX: 0.0, windZ: 0.0, turbFreq: 28.0, turbSpeed: 1.0, fuelEfficiency: 1.0, heatDiffusion: 0.0, stepQuality: 1.0, T_ignite: 0.18, T_burn: 0.55, burnRate: 6.0, fuelInject: 1.0, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
+  { id: 4, name: 'Wood Combustion', params: { vorticity: 2.2, dissipation: 0.903, buoyancy: 1.8, drag: 0.037, emission: 1.9, scattering: 6.5, absorption: 12.0, smokeWeight: 0.5, plumeTurbulence: 2.81, smokeDissipation: 0.985, windX: -0.05, windZ: 0.05, turbFreq: 15.0, turbSpeed: 2.5, fuelEfficiency: 1.5, heatDiffusion: 0.1, stepQuality: 1.0, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 9.0, fuelInject: 1.3, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
+  { id: 1, name: 'Candle', params: { vorticity: 3.5, dissipation: 0.92, buoyancy: 4.5, drag: 0.08, emission: 1.0, scattering: 2.5, absorption: 2.0, smokeWeight: 0.3, plumeTurbulence: 0.05, smokeDissipation: 0.985, windX: 0.0, windZ: 0.0, turbFreq: 45.0, turbSpeed: 0.2, fuelEfficiency: 0.5, heatDiffusion: 0.0, stepQuality: 1.5, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 3.0, fuelInject: 0.7, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
+  { id: 2, name: 'Dual Source', params: { vorticity: 15.0, dissipation: 0.985, buoyancy: 8.0, drag: 0.02, emission: 1.8, scattering: 4.5, absorption: 4.0, smokeWeight: 1.5, plumeTurbulence: 0.3, smokeDissipation: 0.992, windX: 0.2, windZ: 0.2, turbFreq: 20.0, turbSpeed: 1.5, fuelEfficiency: 1.0, heatDiffusion: 0.05, stepQuality: 1.0, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 6.0, fuelInject: 1.0, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
+  { id: 3, name: 'Firebending', params: { vorticity: 12.0, dissipation: 0.965, buoyancy: 5.0, drag: 0.002, emission: 3.0, scattering: 3.5, absorption: 1.5, smokeWeight: 0.5, plumeTurbulence: 0.8, smokeDissipation: 0.98, windX: 0.0, windZ: 0.0, turbFreq: 32.0, turbSpeed: 5.0, fuelEfficiency: 1.2, heatDiffusion: 0.0, stepQuality: 0.8, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 7.2, fuelInject: 1.12, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
+  { id: 5, name: 'Gas Explosion', params: { vorticity: 35.0, dissipation: 0.94, buoyancy: 16.0, drag: 0.01, emission: 6.0, scattering: 4.0, absorption: 1.0, smokeWeight: -0.5, plumeTurbulence: 1.5, smokeDissipation: 0.985, windX: 0.0, windZ: 0.0, turbFreq: 12.0, turbSpeed: 0.5, fuelEfficiency: 3.0, heatDiffusion: 0.2, stepQuality: 1.0, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 18.0, fuelInject: 2.2, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
+  { id: 6, name: 'Nuke', params: { vorticity: 50.0, dissipation: 0.998, buoyancy: 3.0, drag: 0.05, emission: 6.5, scattering: 8.0, absorption: 7.0, smokeWeight: 3.0, plumeTurbulence: 0.4, smokeDissipation: 0.999, windX: 0.0, windZ: 0.0, turbFreq: 8.0, turbSpeed: 0.1, fuelEfficiency: 5.0, heatDiffusion: 0.5, stepQuality: 1.2, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 30.0, fuelInject: 3.4, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } }
 ];
