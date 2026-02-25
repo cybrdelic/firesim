@@ -25,6 +25,9 @@ import {
 } from 'lucide-react';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three/webgpu';
+import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 
 /**
  * SECTION 1: TRANSPORT LAYER (3D)
@@ -1082,6 +1085,18 @@ fn get_light_transmittance(pos: vec3f, lightDir: vec3f) -> f32 {
   return exp(-tau);
 }
 
+fn intersect_aabb(ro: vec3f, rd: vec3f, bmin: vec3f, bmax: vec3f) -> vec2f {
+  let s = select(vec3f(-1.0), vec3f(1.0), rd >= vec3f(0.0));
+  let invRd = s / max(abs(rd), vec3f(1e-6));
+  let t0 = (bmin - ro) * invRd;
+  let t1 = (bmax - ro) * invRd;
+  let tMin = min(t0, t1);
+  let tMax = max(t0, t1);
+  let tNear = max(max(tMin.x, tMin.y), tMin.z);
+  let tFar = min(min(tMax.x, tMax.y), tMax.z);
+  return vec2f(tNear, tFar);
+}
+
 fn sd_box_local(p: vec3f, b: vec3f) -> f32 {
   let q = abs(p) - b;
   return length(max(q, vec3f(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
@@ -1107,20 +1122,29 @@ fn world_occluder_sdf(p: vec3f) -> f32 {
   d = min(d, sd_box_local(p - vec3f(-0.06, 0.13, 0.34), vec3f(0.13, 0.13, 0.13)));
   d = min(d, sd_capsule_local(p, vec3f(0.34, 0.05, -0.1), vec3f(0.34, 0.29, -0.1), 0.1));
   d = min(d, sd_box_local(p - vec3f(0.5, 3.25, -3.4), vec3f(12.0, 4.0, 0.03)));
-  d = min(d, p.y);
   return d;
 }
 
-fn intersect_occluders(ro: vec3f, rd: vec3f, maxT: f32) -> f32 {
-  var t = 0.02;
-  for (var i = 0; i < 84; i++) {
-    if (t > maxT) { break; }
+fn intersect_occluders(ro: vec3f, rd: vec3f, minT: f32, maxT: f32) -> f32 {
+  var hitT = maxT;
+
+  // Analytic floor hit (y=0) is exact and much cheaper than SDF marching.
+  if (rd.y < -1e-5) {
+    let tFloor = (0.0 - ro.y) / rd.y;
+    if (tFloor > minT && tFloor < hitT) {
+      hitT = tFloor;
+    }
+  }
+
+  var t = minT + 0.006;
+  for (var i = 0; i < 52; i++) {
+    if (t > hitT) { break; }
     let p = ro + rd * t;
     let d = world_occluder_sdf(p);
-    if (d < 0.0015) { return t; }
-    t += clamp(d * 0.9, 0.008, 0.22);
+    if (d < 0.0017) { return t; }
+    t += clamp(d * 0.95, 0.012, 0.24);
   }
-  return maxT;
+  return hitT;
 }
 
 @fragment fn frag_main(in: VertexOutput) -> @location(0) vec4f {
@@ -1138,12 +1162,29 @@ fn intersect_occluders(ro: vec3f, rd: vec3f, maxT: f32) -> f32 {
   let jitter = fract(sin(dot(in.uv, vec2f(12.9898, 78.233))) * 43758.5453);
 
   let lightDir = normalize(vec3f(0.3, 1.0, 0.4));
-  let worldHitT = intersect_occluders(ro, rd, 6.0);
-  let maxTraceDist = min(5.5, worldHitT);
+  let boundsPad = 0.12;
+  let volumeHit = intersect_aabb(
+    ro,
+    rd,
+    vec3f(-boundsPad, 0.0, -boundsPad),
+    vec3f(1.0 + boundsPad, params.volumeHeight, 1.0 + boundsPad)
+  );
+  if (volumeHit.y <= max(volumeHit.x, 0.0)) {
+    return vec4f(0.0);
+  }
+
+  let marchStart = max(0.0, volumeHit.x);
+  let volumeExit = min(5.5, volumeHit.y);
+  let worldHitT = intersect_occluders(ro, rd, marchStart, volumeExit);
+  if (worldHitT <= marchStart) {
+    return vec4f(0.0);
+  }
+
+  let maxTraceDist = min(volumeExit, worldHitT);
   let baseSteps = 220;
   let steps = clamp(i32(round(f32(baseSteps) * params.stepQuality)), 1, 720);
   let baseStep = max(1e-4, maxTraceDist / f32(steps));
-  var t = baseStep * (0.5 + jitter);
+  var t = marchStart + baseStep * (0.5 + jitter);
   var accumCol = vec3f(0.0); var transmittance = 1.0; let phaseSun = phase_function(dot(rd, lightDir), params.anisotropyG);
   var cachedSunTrans = 1.0;
   var shadowRefreshCountdown = 0;
@@ -1220,7 +1261,7 @@ fn intersect_occluders(ro: vec3f, rd: vec3f, maxT: f32) -> f32 {
         if (shadowRefreshCountdown <= 0) {
           cachedSunTrans = get_light_transmittance(pos, lightDir);
           let denseMedium = reaction > 0.08 || sigmaT > 0.55;
-          shadowRefreshCountdown = select(4, 0, denseMedium);
+          shadowRefreshCountdown = select(8, 2, denseMedium);
         } else {
           shadowRefreshCountdown -= 1;
         }
@@ -1254,8 +1295,9 @@ fn intersect_occluders(ro: vec3f, rd: vec3f, maxT: f32) -> f32 {
   let mapped = tonemap_aces(accumCol * params.exposure);
   let outColor = pow(mapped, vec3f(1.0 / params.gamma));
   let luma = dot(outColor, vec3f(0.2126, 0.7152, 0.0722));
-  let alpha = clamp(max(1.0 - transmittance, smoothstep(0.02, 0.12, luma)), 0.0, 1.0);
-  return vec4f(outColor, alpha);
+  let alpha = clamp(max(1.0 - transmittance, smoothstep(0.01, 0.09, luma) * 0.82), 0.0, 0.98);
+  // Canvas is configured as premultiplied alpha, so output premultiplied color.
+  return vec4f(outColor * alpha, alpha);
 }
 `;
 
@@ -1830,6 +1872,17 @@ interface WorldRuntime {
   textures: THREE.Texture[];
 }
 
+const SCANNED_LOG_CANDIDATES = [
+  '/models/scanned-log.glb',
+  '/models/scanned-log.gltf',
+  '/models/scanned-log.obj',
+  '/models/scanned-log.fbx',
+  '/models/log-scan/scanned-log.glb',
+  '/models/log-scan/scanned-log.gltf',
+  '/models/log-scan/scanned-log.obj',
+  '/models/log-scan/scanned-log.fbx',
+];
+
 const addWorldProps = (scene: THREE.Scene) => {
   const baseMaterial = new THREE.MeshPhysicalMaterial({
     color: 0x6e747c,
@@ -1853,27 +1906,406 @@ const addWorldProps = (scene: THREE.Scene) => {
 
   const pad = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.08, 1.6), baseMaterial);
   pad.position.set(0.5, 0.04, 0.5);
-  pad.castShadow = true;
-  pad.receiveShadow = true;
+  pad.castShadow = false;
+  pad.receiveShadow = false;
   scene.add(pad);
 
   const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.16, 48, 48), reflectiveMaterial);
   sphere.position.set(1.08, 0.18, 0.26);
-  sphere.castShadow = true;
-  sphere.receiveShadow = true;
+  sphere.castShadow = false;
+  sphere.receiveShadow = false;
   scene.add(sphere);
 
   const box = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.26, 0.26), stoneMaterial);
   box.position.set(-0.06, 0.13, 0.34);
-  box.castShadow = true;
-  box.receiveShadow = true;
+  box.castShadow = false;
+  box.receiveShadow = false;
   scene.add(box);
 
   const capsule = new THREE.Mesh(new THREE.CapsuleGeometry(0.1, 0.24, 14, 24), baseMaterial);
   capsule.position.set(0.34, 0.17, -0.1);
-  capsule.castShadow = true;
-  capsule.receiveShadow = true;
+  capsule.castShadow = false;
+  capsule.receiveShadow = false;
   scene.add(capsule);
+};
+
+const getScannedLogTransforms = () => ([
+  { position: new THREE.Vector3(0.5, 0.08, 0.5), rotation: new THREE.Euler(0, 0, -Math.PI * 0.5 - 0.15) },
+  { position: new THREE.Vector3(0.5, 0.11, 0.5), rotation: new THREE.Euler(Math.PI * 0.5 - 0.15, 0, 0) },
+  { position: new THREE.Vector3(0.5, 0.14, 0.5), rotation: new THREE.Euler(0, Math.PI * 0.25, -Math.PI * 0.5 + 0.1) },
+]);
+
+const makeFallbackLogMaterial = () => new THREE.MeshPhysicalMaterial({
+  color: 0x3c2a1f,
+  roughness: 0.94,
+  metalness: 0.01,
+  clearcoat: 0.0,
+});
+
+const fract = (value: number) => value - Math.floor(value);
+const smooth01 = (value: number) => {
+  const t = clamp(value, 0, 1);
+  return t * t * (3 - 2 * t);
+};
+
+const hash2 = (x: number, y: number, seed: number) => {
+  const dot = x * 127.1 + y * 311.7 + seed * 74.7;
+  return fract(Math.sin(dot) * 43758.5453123);
+};
+
+const valueNoise2 = (x: number, y: number, seed: number) => {
+  const ix = Math.floor(x);
+  const iy = Math.floor(y);
+  const fx = x - ix;
+  const fy = y - iy;
+  const a = hash2(ix, iy, seed);
+  const b = hash2(ix + 1, iy, seed);
+  const c = hash2(ix, iy + 1, seed);
+  const d = hash2(ix + 1, iy + 1, seed);
+  const ux = smooth01(fx);
+  const uy = smooth01(fy);
+  const x1 = lerp(a, b, ux);
+  const x2 = lerp(c, d, ux);
+  return lerp(x1, x2, uy);
+};
+
+const fbm2 = (x: number, y: number, seed: number, octaves = 5) => {
+  let sum = 0;
+  let amp = 0.5;
+  let freq = 1;
+  let ampSum = 0;
+  for (let i = 0; i < octaves; i++) {
+    sum += valueNoise2(x * freq, y * freq, seed + i * 31) * amp;
+    ampSum += amp;
+    amp *= 0.5;
+    freq *= 2;
+  }
+  return sum / Math.max(1e-6, ampSum);
+};
+
+interface ProceduralLogMaterialSet {
+  side: THREE.MeshPhysicalMaterial;
+  cap: THREE.MeshPhysicalMaterial;
+  textures: THREE.Texture[];
+}
+
+const makeProceduralLogMaterials = (seed = 9127, size = 512): ProceduralLogMaterialSet => {
+  const pixelCount = size * size;
+  const colorData = new Uint8Array(pixelCount * 4);
+  const normalData = new Uint8Array(pixelCount * 4);
+  const roughnessData = new Uint8Array(pixelCount * 4);
+  const aoData = new Uint8Array(pixelCount * 4);
+  const heightData = new Float32Array(pixelCount);
+
+  const rowStride = size;
+  for (let y = 0; y < size; y++) {
+    const v = y / Math.max(1, size - 1);
+    for (let x = 0; x < size; x++) {
+      const u = x / Math.max(1, size - 1);
+      const index = y * rowStride + x;
+      const p = index * 4;
+
+      const warp = fbm2(u * 4.3, v * 3.2, seed + 19, 3);
+      const ridges = 1.0 - Math.abs(Math.sin((u + (warp - 0.5) * 0.17) * Math.PI * 36.0));
+      const ridgeMask = Math.pow(clamp(ridges, 0.0, 1.0), 4.2);
+      const coarse = fbm2(u * 12.0 + 1.2, v * 2.1 - 0.8, seed + 41, 4);
+      const fine = fbm2(u * 40.0, v * 8.0 + 0.5, seed + 77, 2);
+      const knotField = fbm2(u * 7.0 - 2.7, v * 12.0 + 1.9, seed + 131, 4);
+      const knot = Math.pow(clamp((knotField - 0.72) / 0.28, 0.0, 1.0), 2.1);
+      const charField = fbm2(u * 9.0 + 2.3, v * 11.0 - 1.1, seed + 211, 3);
+      const char = clamp((charField - 0.81) * 3.0, 0.0, 1.0);
+
+      const height = clamp(0.50 * ridgeMask + 0.34 * coarse + 0.16 * fine + 0.2 * knot, 0.0, 1.0);
+      heightData[index] = height;
+      const cavity = Math.pow(1.0 - height, 1.6);
+
+      const baseR = 78 + height * 64 - cavity * 20 - char * 18;
+      const baseG = 54 + height * 42 - cavity * 15 - char * 12;
+      const baseB = 36 + height * 28 - cavity * 12 - char * 9;
+
+      colorData[p] = clamp(Math.round(baseR), 8, 255);
+      colorData[p + 1] = clamp(Math.round(baseG), 5, 255);
+      colorData[p + 2] = clamp(Math.round(baseB), 3, 255);
+      colorData[p + 3] = 255;
+
+      const roughness = 186 + cavity * 48 + char * 25 - height * 32;
+      roughnessData[p] = clamp(Math.round(roughness), 0, 255);
+      roughnessData[p + 1] = roughnessData[p];
+      roughnessData[p + 2] = roughnessData[p];
+      roughnessData[p + 3] = 255;
+
+      const ao = 138 + cavity * 84 - char * 18;
+      aoData[p] = clamp(Math.round(ao), 0, 255);
+      aoData[p + 1] = aoData[p];
+      aoData[p + 2] = aoData[p];
+      aoData[p + 3] = 255;
+    }
+  }
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const index = y * rowStride + x;
+      const p = index * 4;
+      const xPrev = (x - 1 + size) % size;
+      const xNext = (x + 1) % size;
+      const yPrev = Math.max(0, y - 1);
+      const yNext = Math.min(size - 1, y + 1);
+      const hL = heightData[y * rowStride + xPrev];
+      const hR = heightData[y * rowStride + xNext];
+      const hD = heightData[yPrev * rowStride + x];
+      const hU = heightData[yNext * rowStride + x];
+
+      const nx = (hL - hR) * 2.8;
+      const ny = (hD - hU) * 2.3;
+      const nz = 1.0;
+      const invLen = 1.0 / Math.sqrt(nx * nx + ny * ny + nz * nz);
+
+      normalData[p] = clamp(Math.round((nx * invLen * 0.5 + 0.5) * 255), 0, 255);
+      normalData[p + 1] = clamp(Math.round((ny * invLen * 0.5 + 0.5) * 255), 0, 255);
+      normalData[p + 2] = clamp(Math.round((nz * invLen * 0.5 + 0.5) * 255), 0, 255);
+      normalData[p + 3] = 255;
+    }
+  }
+
+  const colorMap = new THREE.DataTexture(colorData, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
+  colorMap.wrapS = THREE.RepeatWrapping;
+  colorMap.wrapT = THREE.RepeatWrapping;
+  colorMap.anisotropy = 8;
+  colorMap.colorSpace = THREE.SRGBColorSpace;
+  colorMap.needsUpdate = true;
+
+  const normalMap = new THREE.DataTexture(normalData, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
+  normalMap.wrapS = THREE.RepeatWrapping;
+  normalMap.wrapT = THREE.RepeatWrapping;
+  normalMap.anisotropy = 8;
+  normalMap.colorSpace = THREE.NoColorSpace;
+  normalMap.needsUpdate = true;
+
+  const roughnessMap = new THREE.DataTexture(roughnessData, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
+  roughnessMap.wrapS = THREE.RepeatWrapping;
+  roughnessMap.wrapT = THREE.RepeatWrapping;
+  roughnessMap.anisotropy = 8;
+  roughnessMap.colorSpace = THREE.NoColorSpace;
+  roughnessMap.needsUpdate = true;
+
+  const aoMap = new THREE.DataTexture(aoData, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
+  aoMap.wrapS = THREE.RepeatWrapping;
+  aoMap.wrapT = THREE.RepeatWrapping;
+  aoMap.anisotropy = 8;
+  aoMap.colorSpace = THREE.NoColorSpace;
+  aoMap.needsUpdate = true;
+
+  const side = new THREE.MeshPhysicalMaterial({
+    color: 0xffffff,
+    map: colorMap,
+    normalMap,
+    roughnessMap,
+    aoMap,
+    roughness: 1.0,
+    metalness: 0.0,
+    clearcoat: 0.0,
+    emissive: 0x120804,
+    emissiveIntensity: 0.1,
+  });
+  side.normalScale.set(0.85, 0.85);
+
+  const cap = new THREE.MeshPhysicalMaterial({
+    color: 0xb18b67,
+    map: colorMap,
+    roughness: 0.9,
+    metalness: 0.0,
+    emissive: 0x100603,
+    emissiveIntensity: 0.07,
+  });
+
+  return { side, cap, textures: [colorMap, normalMap, roughnessMap, aoMap] };
+};
+
+const makeProceduralLogGeometry = (length: number, radius: number, seed: number) => {
+  const geometry = new THREE.CylinderGeometry(radius * 0.95, radius * 1.03, length, 72, 40, false);
+  const position = geometry.getAttribute('position') as THREE.BufferAttribute;
+  const point = new THREE.Vector3();
+  const random = createSeededRandom(seed);
+  const bendX = (random() - 0.5) * length * 0.05;
+  const bendZ = (random() - 0.5) * length * 0.04;
+
+  for (let i = 0; i < position.count; i++) {
+    point.fromBufferAttribute(position, i);
+    const y01 = point.y / Math.max(1e-6, length) + 0.5;
+    const radial = Math.hypot(point.x, point.z);
+    if (radial > 1e-6) {
+      const angle = Math.atan2(point.z, point.x);
+      const u = angle / (Math.PI * 2) + 0.5;
+      const ridge = fbm2(u * 10.5 + 0.3, y01 * 3.8 - 0.1, seed + 17, 4);
+      const groove = Math.pow(Math.abs(Math.sin((u + fbm2(u * 3.7, y01 * 6.2, seed + 31, 2) * 0.12) * Math.PI * 26.0)), 2.6);
+      const knot = Math.pow(clamp((fbm2(u * 6.0 - 1.7, y01 * 10.0 + 0.9, seed + 79, 3) - 0.82) / 0.18, 0.0, 1.0), 2.0);
+      const end = Math.pow(Math.abs(y01 * 2.0 - 1.0), 2.8);
+      const taper = 1.0 - end * 0.22;
+      const scale = clamp(taper + (ridge - 0.5) * 0.22 + (0.5 - groove) * 0.08 + knot * 0.12, 0.72, 1.42);
+      const target = radial * scale;
+      const inv = target / radial;
+      point.x *= inv;
+      point.z *= inv;
+    }
+
+    const bendT = Math.sin(y01 * Math.PI);
+    point.x += bendX * bendT;
+    point.z += bendZ * bendT;
+    point.y += (fbm2(y01 * 12.0 + 0.3, seed * 0.013 + 2.1, seed + 101, 2) - 0.5) * radius * 0.18;
+    position.setXYZ(i, point.x, point.y, point.z);
+  }
+
+  position.needsUpdate = true;
+  geometry.computeVertexNormals();
+
+  const uv = geometry.getAttribute('uv') as THREE.BufferAttribute | undefined;
+  if (uv) {
+    geometry.setAttribute('uv2', new THREE.BufferAttribute(new Float32Array(uv.array as ArrayLike<number>), 2));
+  }
+  return geometry;
+};
+
+const applyFallbackLogMaterial = (root: THREE.Object3D) => {
+  const fallbackMaterial = makeFallbackLogMaterial();
+  root.traverse((child) => {
+    const mesh = child as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    const material = mesh.material as THREE.Material | THREE.Material[] | undefined;
+    if (!material) {
+      mesh.material = fallbackMaterial;
+      return;
+    }
+    if (Array.isArray(material)) {
+      mesh.material = material.map((entry) => {
+        const anyEntry = entry as any;
+        if (anyEntry?.map || anyEntry?.normalMap || anyEntry?.roughnessMap) return entry;
+        return fallbackMaterial;
+      });
+      return;
+    }
+    const anyMaterial = material as any;
+    if (!anyMaterial.map && !anyMaterial.normalMap && !anyMaterial.roughnessMap) {
+      mesh.material = fallbackMaterial;
+    }
+  });
+};
+
+const normalizeLogSource = (source: THREE.Object3D) => {
+  source.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(source);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  source.position.sub(center);
+  const maxExtent = Math.max(size.x, size.y, size.z, 1e-4);
+  const scale = 0.36 / maxExtent;
+  source.scale.setScalar(scale);
+  source.updateMatrixWorld(true);
+};
+
+const probeModelUrl = async (url: string): Promise<boolean> => {
+  const isHtmlResponse = (contentType: string | null) =>
+    (contentType ?? '').toLowerCase().includes('text/html');
+
+  try {
+    const head = await fetch(url, { method: 'HEAD' });
+    if (head.ok) {
+      if (isHtmlResponse(head.headers.get('content-type'))) return false;
+      return true;
+    }
+
+    // Some dev/proxy setups reject HEAD; fall back to a small GET probe.
+    if (head.status !== 405 && head.status !== 501) return false;
+  } catch {
+    // Fall through to GET probe.
+  }
+
+  try {
+    const getProbe = await fetch(url, {
+      method: 'GET',
+      headers: { Range: 'bytes=0-256' },
+      cache: 'no-store',
+    });
+    if (!getProbe.ok) return false;
+    if (isHtmlResponse(getProbe.headers.get('content-type'))) return false;
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const loadScannedLogModel = async (): Promise<{ root: THREE.Object3D; sourceUrl: string } | null> => {
+  const gltfLoader = new GLTFLoader();
+  const objLoader = new OBJLoader();
+  const fbxLoader = new FBXLoader();
+
+  for (const url of SCANNED_LOG_CANDIDATES) {
+    try {
+      const exists = await probeModelUrl(url);
+      if (!exists) continue;
+
+      if (url.endsWith('.glb') || url.endsWith('.gltf')) {
+        const gltf = await gltfLoader.loadAsync(url);
+        return { root: gltf.scene, sourceUrl: url };
+      }
+      if (url.endsWith('.obj')) {
+        const obj = await objLoader.loadAsync(url);
+        return { root: obj, sourceUrl: url };
+      }
+      if (url.endsWith('.fbx')) {
+        const fbx = await fbxLoader.loadAsync(url);
+        return { root: fbx, sourceUrl: url };
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
+};
+
+const addFallbackLogPile = (scene: THREE.Scene): THREE.Texture[] => {
+  const materialSet = makeProceduralLogMaterials();
+  const transforms = getScannedLogTransforms();
+  const seeds = [313, 911, 1907];
+
+  for (let i = 0; i < transforms.length; i++) {
+    const transform = transforms[i];
+    const random = createSeededRandom(seeds[i]);
+    const length = 0.48 + random() * 0.08;
+    const radius = 0.046 + random() * 0.01;
+    const geometry = makeProceduralLogGeometry(length, radius, seeds[i] + 17);
+    const mesh = new THREE.Mesh(geometry, [materialSet.side, materialSet.cap, materialSet.cap]);
+    mesh.position.copy(transform.position);
+    mesh.position.y += 0.02;
+    mesh.rotation.copy(transform.rotation);
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    scene.add(mesh);
+  }
+
+  return materialSet.textures;
+};
+
+const addCampfireLogPile = async (
+  scene: THREE.Scene
+): Promise<{ loaded: boolean; source?: string; textures?: THREE.Texture[] }> => {
+  const scanned = await loadScannedLogModel();
+  if (!scanned) {
+    const textures = addFallbackLogPile(scene);
+    return { loaded: false, textures };
+  }
+
+  normalizeLogSource(scanned.root);
+  applyFallbackLogMaterial(scanned.root);
+  const transforms = getScannedLogTransforms();
+  for (const transform of transforms) {
+    const instance = scanned.root.clone(true);
+    instance.position.copy(transform.position);
+    instance.rotation.copy(transform.rotation);
+    scene.add(instance);
+  }
+  return { loaded: true, source: scanned.sourceUrl };
 };
 
 const loadTextureSafe = async (
@@ -1960,12 +2392,19 @@ const FluidSimulation: React.FC = () => {
   const stepFramesRef = useRef(0);
   const randomSeedRef = useRef(1337);
   const timelineIdRef = useRef(1);
+  const worldNeedsRenderRef = useRef(true);
+  const renderWorldRef = useRef<(() => void) | null>(null);
+
+  const markWorldDirty = useCallback(() => {
+    worldNeedsRenderRef.current = true;
+  }, []);
 
   useEffect(() => { paramsRef.current = simParams; }, [simParams]);
   useEffect(() => { playingRef.current = isPlaying; }, [isPlaying]);
   useEffect(() => { sceneRef.current = selectedSceneId; }, [selectedSceneId]);
   useEffect(() => { smokeEnabledRef.current = isSmokeEnabled; }, [isSmokeEnabled]);
   useEffect(() => { qualityModeRef.current = qualityMode; }, [qualityMode]);
+  useEffect(() => { markWorldDirty(); }, [markWorldDirty, simParams, dimensions.width, dimensions.height, dimensions.pixelRatio]);
 
   const pushTimeline = useCallback((message: string) => {
     const item: TimelineEvent = { id: timelineIdRef.current, at: Date.now(), message };
@@ -2150,6 +2589,7 @@ const FluidSimulation: React.FC = () => {
     const { theta, phi, radius, target } = cameraRef.current;
     const sP = Math.max(0.01, Math.min(Math.PI - 0.01, phi));
     cameraRef.current.pos = [target[0] + radius * Math.sin(sP) * Math.cos(theta), target[1] + radius * Math.cos(sP), target[2] + radius * Math.sin(sP) * Math.sin(theta)];
+    worldNeedsRenderRef.current = true;
   };
 
   useEffect(() => {
@@ -2157,7 +2597,6 @@ const FluidSimulation: React.FC = () => {
     if (!canvas || !navigator.gpu) return;
 
     let destroyed = false;
-    let rafId = 0;
     let removeResize = () => {};
 
     const initWorld = async () => {
@@ -2177,8 +2616,7 @@ const FluidSimulation: React.FC = () => {
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
       renderer.toneMappingExposure = 1.0;
-      renderer.shadowMap.enabled = true;
-      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.shadowMap.enabled = false;
 
       const scene = new THREE.Scene();
       const skyDay = new THREE.Color(0x9eb6cc);
@@ -2196,15 +2634,7 @@ const FluidSimulation: React.FC = () => {
 
       const keyLight = new THREE.DirectionalLight(0xfff2dd, 2.2);
       keyLight.position.set(-2.6, 4.8, -1.2);
-      keyLight.castShadow = true;
-      keyLight.shadow.mapSize.set(2048, 2048);
-      keyLight.shadow.camera.near = 0.5;
-      keyLight.shadow.camera.far = 40.0;
-      keyLight.shadow.camera.left = -8.0;
-      keyLight.shadow.camera.right = 8.0;
-      keyLight.shadow.camera.top = 8.0;
-      keyLight.shadow.camera.bottom = -8.0;
-      keyLight.shadow.normalBias = 0.02;
+      keyLight.castShadow = false;
       scene.add(keyLight);
 
       const fillLight = new THREE.HemisphereLight(0x9fbfe0, 0x2a3038, 0.48);
@@ -2226,7 +2656,7 @@ const FluidSimulation: React.FC = () => {
       });
       const floorMesh = new THREE.Mesh(floorGeometry, floorMaterial);
       floorMesh.position.set(0.5, 0.0, 0.5);
-      floorMesh.receiveShadow = true;
+      floorMesh.receiveShadow = false;
       floorMesh.castShadow = false;
       scene.add(floorMesh);
 
@@ -2237,14 +2667,21 @@ const FluidSimulation: React.FC = () => {
       });
       const wall = new THREE.Mesh(new THREE.PlaneGeometry(24, 8), wallMaterial);
       wall.position.set(0.5, 3.25, -3.4);
-      wall.receiveShadow = true;
+      wall.receiveShadow = false;
       wall.castShadow = false;
       scene.add(wall);
 
+      const textures: THREE.Texture[] = [];
       addWorldProps(scene);
+      const logAsset = await addCampfireLogPile(scene);
+      if (logAsset.textures?.length) textures.push(...logAsset.textures);
+      if (logAsset.loaded) {
+        pushTimeline(`Loaded scanned log asset (${logAsset.source})`);
+      } else {
+        pushTimeline('No scanned log asset found in /public/models; using procedural scanned-style logs.');
+      }
 
       const loader = new THREE.TextureLoader();
-      const textures: THREE.Texture[] = [];
       const [albedo, normal, roughness] = await Promise.all([
         loadTextureSafe(loader, '/textures/concrete016/Concrete016_1K-JPG_Color.jpg', THREE.SRGBColorSpace),
         loadTextureSafe(loader, '/textures/concrete016/Concrete016_1K-JPG_NormalGL.jpg', THREE.NoColorSpace),
@@ -2297,11 +2734,12 @@ const FluidSimulation: React.FC = () => {
         runtime.camera.updateProjectionMatrix();
         runtime.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
         runtime.renderer.setSize(window.innerWidth, window.innerHeight, false);
+        worldNeedsRenderRef.current = true;
       };
       window.addEventListener('resize', handleResize);
       removeResize = () => window.removeEventListener('resize', handleResize);
 
-      const renderWorld = () => {
+      const renderWorldNow = () => {
         const runtime = worldRuntimeRef.current;
         if (destroyed || !runtime) return;
 
@@ -2337,9 +2775,10 @@ const FluidSimulation: React.FC = () => {
         runtime.wallMaterial.metalness = clamp(0.02 + p.floorSpecular * 0.08, 0.0, 0.18);
 
         runtime.renderer.render(runtime.scene, runtime.camera);
-        rafId = requestAnimationFrame(renderWorld);
       };
-      renderWorld();
+      renderWorldRef.current = renderWorldNow;
+      worldNeedsRenderRef.current = true;
+      renderWorldNow();
     };
 
     initWorld().catch((err) => {
@@ -2350,8 +2789,8 @@ const FluidSimulation: React.FC = () => {
 
     return () => {
       destroyed = true;
-      cancelAnimationFrame(rafId);
       removeResize();
+      renderWorldRef.current = null;
 
       const runtime = worldRuntimeRef.current;
       if (runtime) {
@@ -2542,6 +2981,10 @@ const FluidSimulation: React.FC = () => {
           rp.draw(6);
           rp.end();
           device.queue.submit([enc.finish()]);
+          if (worldNeedsRenderRef.current && renderWorldRef.current) {
+            renderWorldRef.current();
+            worldNeedsRenderRef.current = false;
+          }
           animationFrameId = requestAnimationFrame(render);
         };
         render();
