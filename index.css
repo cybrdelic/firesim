@@ -948,6 +948,21 @@ body {
   z-index: 1;
 }
 
+.deck-world-canvas {
+  z-index: 0;
+  cursor: grab;
+}
+
+.deck-world-canvas:active {
+  cursor: grabbing;
+}
+
+.deck-fire-overlay {
+  pointer-events: none;
+  background: transparent;
+  z-index: 1;
+}
+
 .deck-panel {
   position: relative;
   background: linear-gradient(180deg, rgba(22, 24, 30, 0.86) 0%, rgba(14, 16, 20, 0.78) 100%);

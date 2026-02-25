@@ -11,6 +11,7 @@ import {
     Keyboard,
     Lock,
     LockOpen,
+    Monitor,
     Pause,
     Play,
     RefreshCw,
@@ -23,6 +24,7 @@ import {
     Zap
 } from 'lucide-react';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import * as THREE from 'three/webgpu';
 
 /**
  * SECTION 1: TRANSPORT LAYER (3D)
@@ -53,13 +55,6 @@ class ShaderContract {
   }
 }
 
-interface FloorMaterialTextures {
-  albedoView: GPUTextureView;
-  roughnessView: GPUTextureView;
-  normalView: GPUTextureView;
-  sampler: GPUSampler;
-}
-
 class FluidTransport {
   public uniformBuffer: GPUBuffer;
 
@@ -69,36 +64,37 @@ class FluidTransport {
   public fuelB: GPUBuffer;
   public velocityA: GPUBuffer;
   public velocityB: GPUBuffer;
-
-  public sootFloorSize = 256;
-  public sootFloorTextures: GPUTexture[] = [];
-  public sootFloorViews: GPUTextureView[] = [];
-
-  public radianceDim = 40;
-  public radianceA: GPUBuffer;
-  public radianceB: GPUBuffer;
+  public velocityScratch: GPUBuffer;
+  public divergence: GPUBuffer;
+  public pressureA: GPUBuffer;
+  public pressureB: GPUBuffer;
+  public velocityBufferSize: number;
 
   public physicsContract: ShaderContract;
   public renderContract: ShaderContract;
-  public floorContract: ShaderContract;
-  public radianceInjectContract: ShaderContract;
-  public radiancePropContract: ShaderContract;
+  public projectionDivContract: ShaderContract;
+  public projectionJacobiContract: ShaderContract;
+  public projectionGradContract: ShaderContract;
 
   public physicsGroups: GPUBindGroup[] = [];
-  public renderGroups: GPUBindGroup[][] = [[], []];
-  public floorGroups: GPUBindGroup[][] = [[], []];
-  public radianceInjectGroups: GPUBindGroup[] = [];
-  public radiancePropGroup: GPUBindGroup;
+  public renderGroups: GPUBindGroup[] = [];
+  public projectionDivGroups: GPUBindGroup[] = [];
+  public projectionJacobiGroups: GPUBindGroup[] = [];
+  public projectionGradGroups: GPUBindGroup[][] = [[], []];
 
-  constructor(private device: GPUDevice, public dim: number, private floorMaterial: FloorMaterialTextures) {
+  constructor(
+    private device: GPUDevice,
+    public dim: number
+  ) {
     const VOXEL_COUNT = dim * dim * dim;
 
     this.uniformBuffer = device.createBuffer({
-      size: 256,
+      size: 288,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
 
-    const storageUsage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+    const bufferUsage = (window as any).GPUBufferUsage;
+    const storageUsage = bufferUsage.STORAGE | bufferUsage.COPY_DST | bufferUsage.COPY_SRC;
 
     this.densityA = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
     this.densityB = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
@@ -106,17 +102,16 @@ class FluidTransport {
     this.fuelA = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
     this.fuelB = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
 
-    this.velocityA = device.createBuffer({ size: VOXEL_COUNT * 16, usage: storageUsage });
-    this.velocityB = device.createBuffer({ size: VOXEL_COUNT * 16, usage: storageUsage });
-
-    const radianceVoxelCount = this.radianceDim * this.radianceDim * this.radianceDim;
-    const radianceBufferSize = radianceVoxelCount * 16;
-    this.radianceA = device.createBuffer({ size: radianceBufferSize, usage: storageUsage });
-    this.radianceB = device.createBuffer({ size: radianceBufferSize, usage: storageUsage });
+    this.velocityBufferSize = VOXEL_COUNT * 16;
+    this.velocityA = device.createBuffer({ size: this.velocityBufferSize, usage: storageUsage });
+    this.velocityB = device.createBuffer({ size: this.velocityBufferSize, usage: storageUsage });
+    this.velocityScratch = device.createBuffer({ size: this.velocityBufferSize, usage: storageUsage });
+    this.divergence = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
+    this.pressureA = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
+    this.pressureB = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
 
     const zeroF32 = new Float32Array(VOXEL_COUNT);
     const zeroVec4 = new Float32Array(VOXEL_COUNT * 4);
-    const zeroRadiance = new Float32Array(radianceVoxelCount * 4);
 
     device.queue.writeBuffer(this.densityA, 0, zeroF32);
     device.queue.writeBuffer(this.densityB, 0, zeroF32);
@@ -124,32 +119,10 @@ class FluidTransport {
     device.queue.writeBuffer(this.fuelB, 0, zeroF32);
     device.queue.writeBuffer(this.velocityA, 0, zeroVec4);
     device.queue.writeBuffer(this.velocityB, 0, zeroVec4);
-    device.queue.writeBuffer(this.radianceA, 0, zeroRadiance);
-    device.queue.writeBuffer(this.radianceB, 0, zeroRadiance);
-
-    const textureUsage = (window as any).GPUTextureUsage;
-    const floorTextureUsage = textureUsage.TEXTURE_BINDING | textureUsage.STORAGE_BINDING | textureUsage.COPY_DST;
-    for (let i = 0; i < 2; i++) {
-      const texture = (device as any).createTexture({
-        size: [this.sootFloorSize, this.sootFloorSize],
-        format: 'r32float',
-        usage: floorTextureUsage,
-        label: `SootFloor_${i}`
-      });
-      this.sootFloorTextures.push(texture);
-      this.sootFloorViews.push(texture.createView());
-    }
-
-    const zeroFloor = new Float32Array(this.sootFloorSize * this.sootFloorSize);
-    for (const texture of this.sootFloorTextures) {
-      (device.queue as any).writeTexture(
-        { texture },
-        zeroFloor,
-        { bytesPerRow: this.sootFloorSize * 4, rowsPerImage: this.sootFloorSize },
-        { width: this.sootFloorSize, height: this.sootFloorSize }
-      );
-    }
-
+    device.queue.writeBuffer(this.velocityScratch, 0, zeroVec4);
+    device.queue.writeBuffer(this.divergence, 0, zeroF32);
+    device.queue.writeBuffer(this.pressureA, 0, zeroF32);
+    device.queue.writeBuffer(this.pressureB, 0, zeroF32);
     this.initContracts();
     this.initBindGroups();
   }
@@ -170,35 +143,26 @@ class FluidTransport {
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
       { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
       { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-      { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
-      { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
-      { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
-      { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
-      { binding: 8, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
-      { binding: 9, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     ]);
 
-    this.floorContract = new ShaderContract(this.device, 'FloorSoot', [
-      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
-      { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r32float', viewDimension: '2d' } },
-    ]);
-
-    this.radianceInjectContract = new ShaderContract(this.device, 'RadianceInject', [
-      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    ]);
-
-    this.radiancePropContract = new ShaderContract(this.device, 'RadianceProp', [
+    this.projectionDivContract = new ShaderContract(this.device, 'ProjectionDiv', [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    ]);
+
+    this.projectionJacobiContract = new ShaderContract(this.device, 'ProjectionJacobi', [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    ]);
+
+    this.projectionGradContract = new ShaderContract(this.device, 'ProjectionGrad', [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     ]);
   }
 
@@ -213,46 +177,11 @@ class FluidTransport {
       { binding: 6, resource: { buffer: this.fuelB } },
     ]);
 
-    this.renderGroups[0][0] = this.renderContract.createBindGroup(this.device, 'Render0Soot0', [
+    this.renderGroups[0] = this.renderContract.createBindGroup(this.device, 'Render0', [
       { binding: 0, resource: { buffer: this.uniformBuffer } },
       { binding: 1, resource: { buffer: this.densityB } },
       { binding: 2, resource: { buffer: this.velocityB } },
       { binding: 3, resource: { buffer: this.fuelB } },
-      { binding: 4, resource: this.sootFloorViews[0] },
-      { binding: 5, resource: this.floorMaterial.albedoView },
-      { binding: 6, resource: this.floorMaterial.roughnessView },
-      { binding: 7, resource: this.floorMaterial.normalView },
-      { binding: 8, resource: this.floorMaterial.sampler },
-      { binding: 9, resource: { buffer: this.radianceA } },
-    ]);
-
-    this.renderGroups[0][1] = this.renderContract.createBindGroup(this.device, 'Render0Soot1', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.densityB } },
-      { binding: 2, resource: { buffer: this.velocityB } },
-      { binding: 3, resource: { buffer: this.fuelB } },
-      { binding: 4, resource: this.sootFloorViews[1] },
-      { binding: 5, resource: this.floorMaterial.albedoView },
-      { binding: 6, resource: this.floorMaterial.roughnessView },
-      { binding: 7, resource: this.floorMaterial.normalView },
-      { binding: 8, resource: this.floorMaterial.sampler },
-      { binding: 9, resource: { buffer: this.radianceA } },
-    ]);
-
-    this.floorGroups[0][0] = this.floorContract.createBindGroup(this.device, 'Floor0Soot0', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.densityB } },
-      { binding: 2, resource: { buffer: this.velocityB } },
-      { binding: 3, resource: this.sootFloorViews[0] },
-      { binding: 4, resource: this.sootFloorViews[1] },
-    ]);
-
-    this.floorGroups[0][1] = this.floorContract.createBindGroup(this.device, 'Floor0Soot1', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.densityB } },
-      { binding: 2, resource: { buffer: this.velocityB } },
-      { binding: 3, resource: this.sootFloorViews[1] },
-      { binding: 4, resource: this.sootFloorViews[0] },
     ]);
 
     this.physicsGroups[1] = this.physicsContract.createBindGroup(this.device, 'Phys1', [
@@ -265,70 +194,65 @@ class FluidTransport {
       { binding: 6, resource: { buffer: this.fuelA } },
     ]);
 
-    this.renderGroups[1][0] = this.renderContract.createBindGroup(this.device, 'Render1Soot0', [
+    this.renderGroups[1] = this.renderContract.createBindGroup(this.device, 'Render1', [
       { binding: 0, resource: { buffer: this.uniformBuffer } },
       { binding: 1, resource: { buffer: this.densityA } },
       { binding: 2, resource: { buffer: this.velocityA } },
       { binding: 3, resource: { buffer: this.fuelA } },
-      { binding: 4, resource: this.sootFloorViews[0] },
-      { binding: 5, resource: this.floorMaterial.albedoView },
-      { binding: 6, resource: this.floorMaterial.roughnessView },
-      { binding: 7, resource: this.floorMaterial.normalView },
-      { binding: 8, resource: this.floorMaterial.sampler },
-      { binding: 9, resource: { buffer: this.radianceA } },
     ]);
 
-    this.renderGroups[1][1] = this.renderContract.createBindGroup(this.device, 'Render1Soot1', [
+    this.projectionDivGroups[0] = this.projectionDivContract.createBindGroup(this.device, 'ProjectionDiv0', [
       { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.densityA } },
-      { binding: 2, resource: { buffer: this.velocityA } },
-      { binding: 3, resource: { buffer: this.fuelA } },
-      { binding: 4, resource: this.sootFloorViews[1] },
-      { binding: 5, resource: this.floorMaterial.albedoView },
-      { binding: 6, resource: this.floorMaterial.roughnessView },
-      { binding: 7, resource: this.floorMaterial.normalView },
-      { binding: 8, resource: this.floorMaterial.sampler },
-      { binding: 9, resource: { buffer: this.radianceA } },
+      { binding: 1, resource: { buffer: this.velocityB } },
+      { binding: 2, resource: { buffer: this.divergence } },
     ]);
 
-    this.floorGroups[1][0] = this.floorContract.createBindGroup(this.device, 'Floor1Soot0', [
+    this.projectionDivGroups[1] = this.projectionDivContract.createBindGroup(this.device, 'ProjectionDiv1', [
       { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.densityA } },
-      { binding: 2, resource: { buffer: this.velocityA } },
-      { binding: 3, resource: this.sootFloorViews[0] },
-      { binding: 4, resource: this.sootFloorViews[1] },
+      { binding: 1, resource: { buffer: this.velocityA } },
+      { binding: 2, resource: { buffer: this.divergence } },
     ]);
 
-    this.floorGroups[1][1] = this.floorContract.createBindGroup(this.device, 'Floor1Soot1', [
+    this.projectionJacobiGroups[0] = this.projectionJacobiContract.createBindGroup(this.device, 'ProjectionJacobiA2B', [
       { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.densityA } },
-      { binding: 2, resource: { buffer: this.velocityA } },
-      { binding: 3, resource: this.sootFloorViews[1] },
-      { binding: 4, resource: this.sootFloorViews[0] },
+      { binding: 1, resource: { buffer: this.divergence } },
+      { binding: 2, resource: { buffer: this.pressureA } },
+      { binding: 3, resource: { buffer: this.pressureB } },
     ]);
 
-    this.radianceInjectGroups[0] = this.radianceInjectContract.createBindGroup(this.device, 'RadianceInject0', [
+    this.projectionJacobiGroups[1] = this.projectionJacobiContract.createBindGroup(this.device, 'ProjectionJacobiB2A', [
       { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.densityB } },
-      { binding: 2, resource: { buffer: this.velocityB } },
-      { binding: 3, resource: { buffer: this.fuelB } },
-      { binding: 4, resource: { buffer: this.radianceA } },
-      { binding: 5, resource: { buffer: this.radianceB } },
+      { binding: 1, resource: { buffer: this.divergence } },
+      { binding: 2, resource: { buffer: this.pressureB } },
+      { binding: 3, resource: { buffer: this.pressureA } },
     ]);
 
-    this.radianceInjectGroups[1] = this.radianceInjectContract.createBindGroup(this.device, 'RadianceInject1', [
+    this.projectionGradGroups[0][0] = this.projectionGradContract.createBindGroup(this.device, 'ProjectionGrad0PressureA', [
       { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.densityA } },
-      { binding: 2, resource: { buffer: this.velocityA } },
-      { binding: 3, resource: { buffer: this.fuelA } },
-      { binding: 4, resource: { buffer: this.radianceA } },
-      { binding: 5, resource: { buffer: this.radianceB } },
+      { binding: 1, resource: { buffer: this.velocityScratch } },
+      { binding: 2, resource: { buffer: this.pressureA } },
+      { binding: 3, resource: { buffer: this.velocityB } },
     ]);
 
-    this.radiancePropGroup = this.radiancePropContract.createBindGroup(this.device, 'RadianceProp', [
+    this.projectionGradGroups[0][1] = this.projectionGradContract.createBindGroup(this.device, 'ProjectionGrad0PressureB', [
       { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.radianceB } },
-      { binding: 2, resource: { buffer: this.radianceA } },
+      { binding: 1, resource: { buffer: this.velocityScratch } },
+      { binding: 2, resource: { buffer: this.pressureB } },
+      { binding: 3, resource: { buffer: this.velocityB } },
+    ]);
+
+    this.projectionGradGroups[1][0] = this.projectionGradContract.createBindGroup(this.device, 'ProjectionGrad1PressureA', [
+      { binding: 0, resource: { buffer: this.uniformBuffer } },
+      { binding: 1, resource: { buffer: this.velocityScratch } },
+      { binding: 2, resource: { buffer: this.pressureA } },
+      { binding: 3, resource: { buffer: this.velocityA } },
+    ]);
+
+    this.projectionGradGroups[1][1] = this.projectionGradContract.createBindGroup(this.device, 'ProjectionGrad1PressureB', [
+      { binding: 0, resource: { buffer: this.uniformBuffer } },
+      { binding: 1, resource: { buffer: this.velocityScratch } },
+      { binding: 2, resource: { buffer: this.pressureB } },
+      { binding: 3, resource: { buffer: this.velocityA } },
     ]);
   }
 
@@ -338,7 +262,7 @@ class FluidTransport {
     camera: { pos: number[], target: number[] },
     sceneType: number
   ) {
-    const uniformData = new ArrayBuffer(256);
+    const uniformData = new ArrayBuffer(288);
     const view = new DataView(uniformData);
 
     view.setFloat32(0, this.dim, true);
@@ -426,8 +350,17 @@ class FluidTransport {
 
     view.setFloat32(240, params.lightingFireIntensity ?? 1.75, true);
     view.setFloat32(244, params.lightingFireFalloff ?? 1.1, true);
-    view.setFloat32(248, params.lightingFlicker ?? 0.7, true);
+    view.setFloat32(248, params.lightingFlicker ?? 0.2, true);
     view.setFloat32(252, params.lightingGlow ?? 1.35, true);
+
+    const viewportWidth = Math.max(1, Number(params.renderWidth ?? window.innerWidth));
+    const viewportHeight = Math.max(1, Number(params.renderHeight ?? window.innerHeight));
+    const cameraAspect = viewportWidth / viewportHeight;
+    const cameraTanHalfFov = Math.tan((90.0 * Math.PI / 180.0) * 0.5);
+    view.setFloat32(256, viewportWidth, true);
+    view.setFloat32(260, viewportHeight, true);
+    view.setFloat32(264, cameraAspect, true);
+    view.setFloat32(268, cameraTanHalfFov, true);
 
     this.device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
   }
@@ -516,6 +449,11 @@ struct SimParams {
   lightingFireFalloff: f32,
   lightingFlicker: f32,
   lightingGlow: f32,
+
+  viewportWidth: f32,
+  viewportHeight: f32,
+  cameraAspect: f32,
+  cameraTanHalfFov: f32,
 };
 `;
 
@@ -561,8 +499,8 @@ fn get_wood_normal(p: vec3f) -> vec3f {
 // Wall SDF - a vertical wall behind the fire (proper box SDF)
 fn get_wall_sdf(p: vec3f) -> f32 {
     // Wall center and half-extents
-    let center = vec3f(0.5, 0.4, 0.1);
-    let halfSize = vec3f(0.8, 0.4, 0.02);
+    let center = vec3f(0.5, 0.65, 0.08);
+    let halfSize = vec3f(4.0, 1.2, 0.04);
 
     // Standard box SDF
     let d = abs(p - center) - halfSize;
@@ -862,13 +800,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 }
 `;
 
-const SOOT_FLOOR_UPDATE_SHADER = `
+const PROJECTION_DIVERGENCE_SHADER = `
 ${STRUCT_DEF}
 @group(0) @binding(0) var<uniform> params: SimParams;
-@group(0) @binding(1) var<storage, read> densityIn: array<f32>;
-@group(0) @binding(2) var<storage, read> velocityIn: array<vec4f>;
-@group(0) @binding(3) var sootFloorIn: texture_2d<f32>;
-@group(0) @binding(4) var sootFloorOut: texture_storage_2d<r32float, write>;
+@group(0) @binding(1) var<storage, read> velocityIn: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> divergenceOut: array<f32>;
 
 fn get_idx(p: vec3i) -> u32 {
   let d = i32(params.dim);
@@ -876,180 +812,116 @@ fn get_idx(p: vec3i) -> u32 {
   return u32(cp.z * d * d + cp.y * d + cp.x);
 }
 
-@compute @workgroup_size(8, 8, 1)
+fn sample_velocity_bc(p: vec3i) -> vec3f {
+  let d = i32(params.dim);
+  var v = velocityIn[get_idx(p)].xyz;
+  if (p.x < 0 || p.x >= d) { v.x = 0.0; }
+  if (p.y < 0 || p.y >= d) { v.y = 0.0; }
+  if (p.z < 0 || p.z >= d) { v.z = 0.0; }
+  return v;
+}
+
+@compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
-  let texSize = textureDimensions(sootFloorOut);
-  if (gid.x >= texSize.x || gid.y >= texSize.y) { return; }
+  let dim = u32(params.dim);
+  if (gid.x >= dim || gid.y >= dim || gid.z >= dim) { return; }
+  let c = vec3i(gid);
+  let vL = sample_velocity_bc(c + vec3i(-1, 0, 0));
+  let vR = sample_velocity_bc(c + vec3i(1, 0, 0));
+  let vD = sample_velocity_bc(c + vec3i(0, -1, 0));
+  let vU = sample_velocity_bc(c + vec3i(0, 1, 0));
+  let vB = sample_velocity_bc(c + vec3i(0, 0, -1));
+  let vF = sample_velocity_bc(c + vec3i(0, 0, 1));
 
-  let uv = (vec2f(gid.xy) + 0.5) / vec2f(texSize);
-  let x = i32(clamp(uv.x * params.dim, 0.0, params.dim - 1.0));
-  let z = i32(clamp(uv.y * params.dim, 0.0, params.dim - 1.0));
-
-  let yMax = max(0.03, min(0.12, params.volumeHeight * 0.12));
-  let ySamples = 10;
-  var sootSum = 0.0;
-  var wSum = 0.0;
-
-  for (var i = 0; i < ySamples; i++) {
-    let fy = (f32(i) + 0.5) / f32(ySamples);
-    let yUv = fy * yMax;
-    let y = i32(clamp(yUv * params.dim, 0.0, params.dim - 1.0));
-    let idx = get_idx(vec3i(x, y, z));
-
-    let temp = max(0.0, densityIn[idx]);
-    let soot = max(0.0, velocityIn[idx].w);
-    let vy = velocityIn[idx].y;
-
-    let coolGate = smoothstep(0.8, 0.12, temp);
-    let settleGate = smoothstep(1.0, -0.15, vy);
-    let nearFloor = 1.0 - fy;
-    let w = coolGate * settleGate * nearFloor;
-    let thermalResidue = max(0.0, temp - params.T_ignite) * 0.35;
-    let source = soot + thermalResidue;
-
-    sootSum += source * w;
-    wSum += w;
-  }
-
-  let sootSlab = sootSum / max(1e-5, wSum);
-  let coord = vec2i(gid.xy);
-  let prev = textureLoad(sootFloorIn, coord, 0).x;
-
-  let depositRate = 2.4;
-  let decayRate = 0.0005;
-  let add = sootSlab * depositRate * params.dt;
-  let next = clamp(prev * (1.0 - decayRate) + add, 0.0, 1.0);
-  textureStore(sootFloorOut, coord, vec4f(next, 0.0, 0.0, 0.0));
+  let h = 1.0 / max(1.0, params.dim);
+  let div = (vR.x - vL.x + vU.y - vD.y + vF.z - vB.z) / (2.0 * h);
+  divergenceOut[get_idx(c)] = div;
 }
 `;
 
-const RADIANCE_CACHE_INJECT_SHADER = `
+const PROJECTION_JACOBI_SHADER = `
 ${STRUCT_DEF}
 @group(0) @binding(0) var<uniform> params: SimParams;
-@group(0) @binding(1) var<storage, read> densityIn: array<f32>;
-@group(0) @binding(2) var<storage, read> velocityIn: array<vec4f>;
-@group(0) @binding(3) var<storage, read> fuelIn: array<f32>;
-@group(0) @binding(4) var<storage, read> radiancePrev: array<vec4f>;
-@group(0) @binding(5) var<storage, read_write> radianceOut: array<vec4f>;
+@group(0) @binding(1) var<storage, read> divergenceIn: array<f32>;
+@group(0) @binding(2) var<storage, read> pressureIn: array<f32>;
+@group(0) @binding(3) var<storage, read_write> pressureOut: array<f32>;
 
-const RAD_DIM: i32 = 40;
-const RAD_DIM_U: u32 = 40u;
-
-fn sim_idx(p: vec3i) -> u32 {
+fn get_idx(p: vec3i) -> u32 {
   let d = i32(params.dim);
   let cp = clamp(p, vec3i(0), vec3i(d - 1));
   return u32(cp.z * d * d + cp.y * d + cp.x);
 }
 
-fn sample_volume(uv: vec3f) -> vec3f {
-  let d = params.dim;
-  let p = uv * d - 0.5;
-  let i = vec3i(floor(p));
-  let f = fract(p);
-  let temp = mix(
-    mix(mix(densityIn[sim_idx(i)], densityIn[sim_idx(i + vec3i(1, 0, 0))], f.x), mix(densityIn[sim_idx(i + vec3i(0, 1, 0))], densityIn[sim_idx(i + vec3i(1, 1, 0))], f.x), f.y),
-    mix(mix(densityIn[sim_idx(i + vec3i(0, 0, 1))], densityIn[sim_idx(i + vec3i(1, 0, 1))], f.x), mix(densityIn[sim_idx(i + vec3i(0, 1, 1))], densityIn[sim_idx(i + vec3i(1, 1, 1))], f.x), f.y),
-    f.z
-  );
-  let soot = mix(
-    mix(mix(velocityIn[sim_idx(i)].w, velocityIn[sim_idx(i + vec3i(1, 0, 0))].w, f.x), mix(velocityIn[sim_idx(i + vec3i(0, 1, 0))].w, velocityIn[sim_idx(i + vec3i(1, 1, 0))].w, f.x), f.y),
-    mix(mix(velocityIn[sim_idx(i + vec3i(0, 0, 1))].w, velocityIn[sim_idx(i + vec3i(1, 0, 1))].w, f.x), mix(velocityIn[sim_idx(i + vec3i(0, 1, 1))].w, velocityIn[sim_idx(i + vec3i(1, 1, 1))].w, f.x), f.y),
-    f.z
-  );
-  let fuel = mix(
-    mix(mix(fuelIn[sim_idx(i)], fuelIn[sim_idx(i + vec3i(1, 0, 0))], f.x), mix(fuelIn[sim_idx(i + vec3i(0, 1, 0))], fuelIn[sim_idx(i + vec3i(1, 1, 0))], f.x), f.y),
-    mix(mix(fuelIn[sim_idx(i + vec3i(0, 0, 1))], fuelIn[sim_idx(i + vec3i(1, 0, 1))], f.x), mix(fuelIn[sim_idx(i + vec3i(0, 1, 1))], fuelIn[sim_idx(i + vec3i(1, 1, 1))], f.x), f.y),
-    f.z
-  );
-  return vec3f(temp, soot, fuel);
-}
-
-fn blackbody_fast(temp: f32) -> vec3f {
-  let t = max(0.0, temp - 0.12);
-  if (t < 0.3) { return mix(vec3f(0.0), vec3f(2.0, 0.06, 0.004), t / 0.3); }
-  if (t < 0.75) { return mix(vec3f(2.0, 0.06, 0.004), vec3f(5.0, 1.7, 0.2), (t - 0.3) / 0.45); }
-  if (t < 1.4) { return mix(vec3f(5.0, 1.7, 0.2), vec3f(10.0, 7.0, 1.6), (t - 0.75) / 0.65); }
-  return mix(vec3f(10.0, 7.0, 1.6), vec3f(22.0, 20.0, 16.0), clamp((t - 1.4) * 0.4, 0.0, 1.0));
-}
-
-fn rad_idx(p: vec3i) -> u32 {
-  let cp = clamp(p, vec3i(0), vec3i(RAD_DIM - 1));
-  return u32(cp.z * RAD_DIM * RAD_DIM + cp.y * RAD_DIM + cp.x);
-}
-
-fn rad_bounds_min() -> vec3f {
-  return vec3f(-0.7, 0.0, -0.7);
-}
-
-fn rad_bounds_max() -> vec3f {
-  return vec3f(1.7, max(1.25, params.volumeHeight * 1.95), 1.7);
-}
-
-fn inside_sim_world(p: vec3f) -> bool {
-  return p.x >= 0.0 && p.x <= 1.0 && p.z >= 0.0 && p.z <= 1.0 && p.y >= 0.0 && p.y <= params.volumeHeight;
+fn sample_pressure_neumann(p: vec3i) -> f32 {
+  return pressureIn[get_idx(p)];
 }
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
-  if (gid.x >= RAD_DIM_U || gid.y >= RAD_DIM_U || gid.z >= RAD_DIM_U) { return; }
+  let dim = u32(params.dim);
+  if (gid.x >= dim || gid.y >= dim || gid.z >= dim) { return; }
+  let c = vec3i(gid);
 
-  let cell = vec3i(gid.xyz);
-  let idx = rad_idx(cell);
-  let uv = (vec3f(gid.xyz) + 0.5) / f32(RAD_DIM);
-  let bmin = rad_bounds_min();
-  let bmax = rad_bounds_max();
-  let worldPos = mix(bmin, bmax, uv);
+  let pL = sample_pressure_neumann(c + vec3i(-1, 0, 0));
+  let pR = sample_pressure_neumann(c + vec3i(1, 0, 0));
+  let pD = sample_pressure_neumann(c + vec3i(0, -1, 0));
+  let pU = sample_pressure_neumann(c + vec3i(0, 1, 0));
+  let pB = sample_pressure_neumann(c + vec3i(0, 0, -1));
+  let pF = sample_pressure_neumann(c + vec3i(0, 0, 1));
 
-  var emit = vec3f(0.0);
-  var absorb = 0.0;
-
-  if (inside_sim_world(worldPos)) {
-    let simUv = vec3f(worldPos.x, clamp(worldPos.y / max(1e-4, params.volumeHeight), 0.0, 1.0), worldPos.z);
-    let s = sample_volume(simUv);
-    let temp = max(0.0, s.x);
-    let soot = max(0.0, s.y);
-    let fuel = max(0.0, s.z);
-    let reaction = smoothstep(params.T_ignite, params.T_burn, temp) * (0.2 + 0.8 * smoothstep(0.0, 0.08, fuel));
-    emit = blackbody_fast(temp) * params.emission * reaction * 0.045;
-    absorb = soot * 0.04;
-  }
-
-  let prev = radiancePrev[idx].xyz;
-  let history = prev * max(0.0, 0.962 - absorb * 0.15);
-  let next = max(vec3f(0.0), history + emit * params.dt * 60.0);
-  radianceOut[idx] = vec4f(next, 1.0);
+  let h = 1.0 / max(1.0, params.dim);
+  let h2 = h * h;
+  let div = divergenceIn[get_idx(c)];
+  let relaxed = (pL + pR + pD + pU + pB + pF - div * h2) / 6.0;
+  pressureOut[get_idx(c)] = relaxed;
 }
 `;
 
-const RADIANCE_CACHE_PROPAGATE_SHADER = `
+const PROJECTION_GRADIENT_SHADER = `
 ${STRUCT_DEF}
 @group(0) @binding(0) var<uniform> params: SimParams;
-@group(0) @binding(1) var<storage, read> radianceIn: array<vec4f>;
-@group(0) @binding(2) var<storage, read_write> radianceOut: array<vec4f>;
+@group(0) @binding(1) var<storage, read> velocityIn: array<vec4f>;
+@group(0) @binding(2) var<storage, read> pressureIn: array<f32>;
+@group(0) @binding(3) var<storage, read_write> velocityOut: array<vec4f>;
 
-const RAD_DIM: i32 = 40;
-const RAD_DIM_U: u32 = 40u;
+fn get_idx(p: vec3i) -> u32 {
+  let d = i32(params.dim);
+  let cp = clamp(p, vec3i(0), vec3i(d - 1));
+  return u32(cp.z * d * d + cp.y * d + cp.x);
+}
 
-fn rad_idx(p: vec3i) -> u32 {
-  let cp = clamp(p, vec3i(0), vec3i(RAD_DIM - 1));
-  return u32(cp.z * RAD_DIM * RAD_DIM + cp.y * RAD_DIM + cp.x);
+fn sample_pressure_neumann(p: vec3i) -> f32 {
+  return pressureIn[get_idx(p)];
 }
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
-  if (gid.x >= RAD_DIM_U || gid.y >= RAD_DIM_U || gid.z >= RAD_DIM_U) { return; }
+  let dim = u32(params.dim);
+  if (gid.x >= dim || gid.y >= dim || gid.z >= dim) { return; }
+  let c = vec3i(gid);
+  let h = 1.0 / max(1.0, params.dim);
 
-  let c = vec3i(gid.xyz);
-  let center = radianceIn[rad_idx(c)].xyz;
-  var accum = center * 0.38;
-  accum += radianceIn[rad_idx(c + vec3i(1, 0, 0))].xyz * 0.103333;
-  accum += radianceIn[rad_idx(c + vec3i(-1, 0, 0))].xyz * 0.103333;
-  accum += radianceIn[rad_idx(c + vec3i(0, 1, 0))].xyz * 0.103333;
-  accum += radianceIn[rad_idx(c + vec3i(0, -1, 0))].xyz * 0.103333;
-  accum += radianceIn[rad_idx(c + vec3i(0, 0, 1))].xyz * 0.103333;
-  accum += radianceIn[rad_idx(c + vec3i(0, 0, -1))].xyz * 0.103333;
-  let next = max(vec3f(0.0), accum * 0.988);
-  radianceOut[rad_idx(c)] = vec4f(next, 1.0);
+  let pL = sample_pressure_neumann(c + vec3i(-1, 0, 0));
+  let pR = sample_pressure_neumann(c + vec3i(1, 0, 0));
+  let pD = sample_pressure_neumann(c + vec3i(0, -1, 0));
+  let pU = sample_pressure_neumann(c + vec3i(0, 1, 0));
+  let pB = sample_pressure_neumann(c + vec3i(0, 0, -1));
+  let pF = sample_pressure_neumann(c + vec3i(0, 0, 1));
+
+  let gradP = vec3f(
+    (pR - pL) / (2.0 * h),
+    (pU - pD) / (2.0 * h),
+    (pF - pB) / (2.0 * h)
+  );
+
+  let current = velocityIn[get_idx(c)];
+  var projected = current.xyz - gradP;
+  let d = i32(params.dim);
+  if (c.x == 0 || c.x == d - 1) { projected.x = 0.0; }
+  if (c.y == 0) { projected.y = max(0.0, projected.y); }
+  if (c.z == 0 || c.z == d - 1) { projected.z = 0.0; }
+
+  velocityOut[get_idx(c)] = vec4f(projected, current.w);
 }
 `;
 
@@ -1060,12 +932,6 @@ ${WOOD_SDF_FN}
 @group(0) @binding(1) var<storage, read> densityIn: array<f32>;
 @group(0) @binding(2) var<storage, read> velocityIn: array<vec4f>;
 @group(0) @binding(3) var<storage, read> fuelIn: array<f32>;
-@group(0) @binding(4) var sootFloorTex: texture_2d<f32>;
-@group(0) @binding(5) var floorAlbedoTex: texture_2d<f32>;
-@group(0) @binding(6) var floorRoughnessTex: texture_2d<f32>;
-@group(0) @binding(7) var floorNormalTex: texture_2d<f32>;
-@group(0) @binding(8) var floorSampler: sampler;
-@group(0) @binding(9) var<storage, read> radianceCache: array<vec4f>;
 
 struct VertexOutput { @builtin(position) Position : vec4f, @location(0) uv : vec2f };
 
@@ -1079,6 +945,12 @@ fn get_idx(p: vec3i) -> u32 {
   let d = i32(params.dim);
   let cp = clamp(p, vec3i(0), vec3i(d - 1));
   return u32(cp.z * d * d + cp.y * d + cp.x);
+}
+
+fn safe_norm(v: vec3f, fallback: vec3f) -> vec3f {
+  let l2 = dot(v, v);
+  if (!(l2 > 1e-12)) { return fallback; }
+  return v * inverseSqrt(l2);
 }
 
 fn inside_volume_world(p: vec3f) -> bool {
@@ -1095,7 +967,7 @@ fn volume_edge_falloff_uv(uv: vec3f) -> f32 {
   let ey = min(uv.y, 1.0 - uv.y);
   let ez = min(uv.z, 1.0 - uv.z);
   let edge = min(min(ex, ey), ez);
-  return smoothstep(0.0, 0.065, edge);
+  return smoothstep(0.0, 0.11, edge);
 }
 
 fn sample_volume(pos: vec3f) -> vec3f {
@@ -1115,123 +987,13 @@ fn sample_medium_world(p: vec3f) -> vec4f {
 }
 
 fn sample_velocity_nearest(pos: vec3f) -> vec3f {
-  // Nearest-voxel velocity fetch (much cheaper than tri-linear).
-  // Good enough for flow-locked micro detail.
   let d = params.dim;
   let p = pos * d - 0.5;
   let i = vec3i(floor(p));
   return velocityIn[get_idx(i)].xyz;
 }
 
-const RAD_DIM: i32 = 40;
-
-fn rad_idx(p: vec3i) -> u32 {
-  let cp = clamp(p, vec3i(0), vec3i(RAD_DIM - 1));
-  return u32(cp.z * RAD_DIM * RAD_DIM + cp.y * RAD_DIM + cp.x);
-}
-
-fn rad_bounds_min() -> vec3f {
-  return vec3f(-0.7, 0.0, -0.7);
-}
-
-fn rad_bounds_max() -> vec3f {
-  return vec3f(1.7, max(1.25, params.volumeHeight * 1.95), 1.7);
-}
-
-fn sample_radiance_cache(worldPos: vec3f) -> vec3f {
-  let bmin = rad_bounds_min();
-  let bmax = rad_bounds_max();
-  let ext = max(vec3f(1e-4), bmax - bmin);
-  let uv = (worldPos - bmin) / ext;
-  if (any(uv < vec3f(0.0)) || any(uv > vec3f(1.0))) { return vec3f(0.0); }
-
-  let p = uv * f32(RAD_DIM) - 0.5;
-  let i = vec3i(floor(p));
-  let f = fract(p);
-
-  let c000 = radianceCache[rad_idx(i)].xyz;
-  let c100 = radianceCache[rad_idx(i + vec3i(1, 0, 0))].xyz;
-  let c010 = radianceCache[rad_idx(i + vec3i(0, 1, 0))].xyz;
-  let c110 = radianceCache[rad_idx(i + vec3i(1, 1, 0))].xyz;
-  let c001 = radianceCache[rad_idx(i + vec3i(0, 0, 1))].xyz;
-  let c101 = radianceCache[rad_idx(i + vec3i(1, 0, 1))].xyz;
-  let c011 = radianceCache[rad_idx(i + vec3i(0, 1, 1))].xyz;
-  let c111 = radianceCache[rad_idx(i + vec3i(1, 1, 1))].xyz;
-
-  return mix(
-    mix(mix(c000, c100, f.x), mix(c010, c110, f.x), f.y),
-    mix(mix(c001, c101, f.x), mix(c011, c111, f.x), f.y),
-    f.z
-  );
-}
-
-fn sample_soot_floor(uv: vec2f) -> f32 {
-  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-    return 0.0;
-  }
-  let dimsI = vec2i(textureDimensions(sootFloorTex));
-  let dims = vec2f(dimsI);
-  let p = clamp(uv, vec2f(0.0), vec2f(0.9999)) * dims - 0.5;
-  let i = vec2i(floor(p));
-  let f = fract(p);
-  let maxI = dimsI - vec2i(1, 1);
-  let i00 = clamp(i, vec2i(0, 0), maxI);
-  let i10 = clamp(i + vec2i(1, 0), vec2i(0, 0), maxI);
-  let i01 = clamp(i + vec2i(0, 1), vec2i(0, 0), maxI);
-  let i11 = clamp(i + vec2i(1, 1), vec2i(0, 0), maxI);
-  let s00 = textureLoad(sootFloorTex, i00, 0).x;
-  let s10 = textureLoad(sootFloorTex, i10, 0).x;
-  let s01 = textureLoad(sootFloorTex, i01, 0).x;
-  let s11 = textureLoad(sootFloorTex, i11, 0).x;
-  return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
-}
-
-fn sample_tex2d(tex: texture_2d<f32>, uv: vec2f) -> vec4f {
-  return textureSampleLevel(tex, floorSampler, uv, 0.0);
-}
-
-fn sample_floor_albedo(uv: vec2f) -> vec3f {
-  return sample_tex2d(floorAlbedoTex, uv).rgb;
-}
-
-fn sample_floor_roughness(uv: vec2f) -> f32 {
-  return sample_tex2d(floorRoughnessTex, uv).r;
-}
-
-fn sample_floor_normal(uv: vec2f) -> vec3f {
-  let t = sample_tex2d(floorNormalTex, uv).xyz * 2.0 - 1.0;
-  // Floor tangent frame: +x tangent, +z bitangent, +y normal.
-  return normalize(vec3f(t.x, t.z, max(0.05, t.y)));
-}
-
-fn floor_micro_height(uv: vec2f, sootDep: f32) -> f32 {
-  let n0 = cheap_noise(vec3f(uv * 22.0, 1.7));
-  let n1 = cheap_noise(vec3f(uv * 63.0 + vec2f(13.0, 7.0), 5.1));
-  let n2 = cheap_noise(vec3f(uv * 141.0 + vec2f(4.0, 27.0), 9.7));
-  let amp = mix(0.0013, 0.0022, clamp(sootDep, 0.0, 1.0));
-  return (n0 * 0.45 + n1 * 0.35 + n2 * 0.2) * amp;
-}
-
-fn floor_micro_normal(uv: vec2f, sootDep: f32) -> vec3f {
-  let e = 0.0018;
-  let hL = floor_micro_height(uv - vec2f(e, 0.0), sootDep);
-  let hR = floor_micro_height(uv + vec2f(e, 0.0), sootDep);
-  let hD = floor_micro_height(uv - vec2f(0.0, e), sootDep);
-  let hU = floor_micro_height(uv + vec2f(0.0, e), sootDep);
-  let dx = (hR - hL) / (2.0 * e);
-  let dz = (hU - hD) / (2.0 * e);
-  return normalize(vec3f(-dx, 1.0, -dz));
-}
-
-fn fresnel_schlick(cosTheta: f32, f0: vec3f) -> vec3f {
-  let m = clamp(1.0 - cosTheta, 0.0, 1.0);
-  let m2 = m * m;
-  let m5 = m2 * m2 * m;
-  return f0 + (vec3f(1.0) - f0) * m5;
-}
-
 fn hash_vec3(p: vec3f) -> vec3f {
-  // Cheap hash (no trig) in [-1, 1]
   var p3 = fract(p * vec3f(0.1031, 0.1030, 0.0973));
   p3 += dot(p3, p3.yxz + 33.33);
   return fract((p3.xxy + p3.yxx) * p3.zyx) * 2.0 - 1.0;
@@ -1241,82 +1003,7 @@ fn cheap_noise(p: vec3f) -> f32 {
   return dot(hash_vec3(p), vec3f(0.3333333));
 }
 
-fn rotate_uv(uv: vec2f, angle: f32) -> vec2f {
-  let c = cos(angle);
-  let s = sin(angle);
-  return vec2f(c * uv.x - s * uv.y, s * uv.x + c * uv.y);
-}
-
-fn rotate_floor_tangent_normal(n: vec3f, angle: f32) -> vec3f {
-  let c = cos(angle);
-  let s = sin(angle);
-  return normalize(vec3f(n.x * c - n.z * s, n.y, n.x * s + n.z * c));
-}
-
-fn floor_uv_warp(uv: vec2f) -> vec2f {
-  let w0 = cheap_noise(vec3f(uv * 0.43 + vec2f(1.2, -0.7), 2.3));
-  let w1 = cheap_noise(vec3f(uv * 0.36 + vec2f(-2.7, 3.9), 5.1));
-  let warpStrength = clamp(params.floorUvWarp, 0.0, 3.0);
-  let warp = vec2f(w0, w1) * (0.09 * warpStrength);
-  return uv + warp;
-}
-
-fn sample_floor_albedo_layered(uv: vec2f) -> vec3f {
-  let uvw = floor_uv_warp(uv);
-  let floorScale = max(0.2, params.floorUvScale);
-  let uv0 = rotate_uv(uvw * (1.42 * floorScale) + vec2f(0.17, -0.13), 0.31);
-  let uv1 = rotate_uv(uvw * (2.31 * floorScale) + vec2f(0.37, 0.11), 0.97);
-  let blendNoiseA = cheap_noise(vec3f(uvw * 0.77 + vec2f(3.2, -1.7), 2.4)) * 0.5 + 0.5;
-  let blendNoiseB = cheap_noise(vec3f(uvw * 1.13 + vec2f(-4.1, 2.6), 4.2)) * 0.5 + 0.5;
-  let blendStrength = clamp(params.floorBlendStrength, 0.0, 1.5);
-  let blend = clamp(0.5 + (blendNoiseA - 0.5) * 0.46 * blendStrength + (blendNoiseB - 0.5) * 0.34 * blendStrength, 0.2, 0.8);
-  let a0 = sample_floor_albedo(uv0);
-  let a1 = sample_floor_albedo(uv1);
-  return mix(a0, a1, blend);
-}
-
-fn sample_floor_roughness_layered(uv: vec2f) -> f32 {
-  let uvw = floor_uv_warp(uv);
-  let floorScale = max(0.2, params.floorUvScale);
-  let uv0 = rotate_uv(uvw * (1.42 * floorScale) + vec2f(0.17, -0.13), 0.31);
-  let uv1 = rotate_uv(uvw * (2.31 * floorScale) + vec2f(0.37, 0.11), 0.97);
-  let blendNoiseA = cheap_noise(vec3f(uvw * 0.71 + vec2f(-2.1, 4.8), 5.6)) * 0.5 + 0.5;
-  let blendNoiseB = cheap_noise(vec3f(uvw * 1.21 + vec2f(1.5, -3.4), 6.4)) * 0.5 + 0.5;
-  let blendStrength = clamp(params.floorBlendStrength, 0.0, 1.5);
-  let blend = clamp(0.5 + (blendNoiseA - 0.5) * 0.5 * blendStrength + (blendNoiseB - 0.5) * 0.32 * blendStrength, 0.2, 0.8);
-  let r0 = sample_floor_roughness(uv0);
-  let r1 = sample_floor_roughness(uv1);
-  return mix(r0, r1, blend);
-}
-
-fn sample_floor_normal_layered(uv: vec2f) -> vec3f {
-  let uvw = floor_uv_warp(uv);
-  let angle0 = 0.31;
-  let angle1 = 0.97;
-  let floorScale = max(0.2, params.floorUvScale);
-  let uv0 = rotate_uv(uvw * (1.42 * floorScale) + vec2f(0.17, -0.13), angle0);
-  let uv1 = rotate_uv(uvw * (2.31 * floorScale) + vec2f(0.37, 0.11), angle1);
-  let blendNoiseA = cheap_noise(vec3f(uvw * 0.83 + vec2f(1.7, 0.6), 7.1)) * 0.5 + 0.5;
-  let blendNoiseB = cheap_noise(vec3f(uvw * 1.17 + vec2f(-0.9, -2.8), 8.6)) * 0.5 + 0.5;
-  let blendStrength = clamp(params.floorBlendStrength, 0.0, 1.5);
-  let blend = clamp(0.5 + (blendNoiseA - 0.5) * 0.48 * blendStrength + (blendNoiseB - 0.5) * 0.28 * blendStrength, 0.2, 0.8);
-  let n0 = sample_floor_normal(uv0);
-  let n1 = rotate_floor_tangent_normal(sample_floor_normal(uv1), angle1 - angle0);
-  return normalize(mix(n0, n1, blend));
-}
-
-fn floor_contact_mask(p: vec3f) -> f32 {
-  if (params.sceneType != 0.0 && params.sceneType != 4.0) {
-    return 0.0;
-  }
-  let d = get_wood_sdf(vec3f(p.x, 0.028, p.z));
-  let near = 1.0 - smoothstep(0.01, 0.13, d);
-  return clamp(near, 0.0, 1.0);
-}
-
 fn compute_reaction(pos: vec3f, temp: f32) -> f32 {
-  // Flame lives on thin temperature edges, not in the hot volume.
-  // reaction = smoothstep(T_ignite, T_hot, T) * smoothstep(g0, g1, |∇T|)
   let tempGate = smoothstep(params.T_ignite, params.T_burn, temp);
   if (tempGate < 0.001) { return 0.0; }
 
@@ -1338,7 +1025,6 @@ fn compute_reaction(pos: vec3f, temp: f32) -> f32 {
 }
 
 fn tonemap_aces(color: vec3f) -> vec3f {
-  // ACES approximation (Narkowicz 2015). Keeps HDR highlights structured.
   let a = 2.51;
   let b = 0.03;
   let c = 2.43;
@@ -1357,42 +1043,6 @@ fn getBlackbodyColor(temp: f32) -> vec3f {
    else if (t < 0.75) { return mix(vec3f(2.2, 0.05, 0.002), vec3f(5.5, 1.8, 0.1), (t - 0.3) / 0.45); }
    else if (t < 1.4) { return mix(vec3f(5.5, 1.8, 0.1), vec3f(12.0, 8.0, 1.2), (t - 0.75) / 0.65); }
    else { return mix(vec3f(12.0, 8.0, 1.2), vec3f(35.0, 35.0, 35.0), clamp((t - 1.4) * 0.4, 0.0, 1.0)); }
-}
-
-fn fire_anchor() -> vec3f {
-  let h = clamp(params.volumeHeight * 0.22, 0.1, 0.24);
-  return vec3f(0.5, h, 0.5);
-}
-
-fn fire_light_approx(p: vec3f) -> vec3f {
-  let firePos = fire_anchor();
-  let toF = firePos - p;
-  let r2 = max(1e-5, dot(toF, toF));
-  let r = sqrt(r2);
-  let dir = toF / r;
-  let falloffScale = max(0.15, params.lightingFireFalloff);
-  let falloff = 1.0 / (1.0 + r2 * (13.0 * falloffScale));
-  let flickAmp = clamp(params.lightingFlicker, 0.0, 1.0);
-  let flickA = (1.0 - 0.22 * flickAmp) + (0.22 * flickAmp) * sin(params.time * 9.3 + p.x * 4.1 + p.z * 3.7);
-  let flickB = (1.0 - 0.14 * flickAmp) + (0.14 * flickAmp) * sin(params.time * 14.2);
-  let flicker = max(0.55, flickA * flickB);
-  let upBias = 0.45 + 0.55 * clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
-  let warm = vec3f(1.0, 0.40, 0.15);
-  let hot = vec3f(1.0, 0.74, 0.33);
-  let spectrum = mix(warm, hot, 0.42);
-  let intensity = max(0.0, params.emission) * 0.095 * max(0.0, params.lightingFireIntensity);
-  return spectrum * intensity * falloff * flicker * upBias;
-}
-
-fn fire_glow_along_ray(ro: vec3f, rd: vec3f) -> vec3f {
-  let firePos = fire_anchor();
-  let t = clamp(dot(firePos - ro, rd), 0.0, 4.0);
-  let closest = ro + rd * t;
-  let d = length(closest - firePos);
-  let haze = exp(-d * d * 6.5) * max(0.0, params.emission) * 0.026 * max(0.0, params.lightingGlow);
-  let flickAmp = clamp(params.lightingFlicker, 0.0, 1.0);
-  let flick = (1.0 - 0.18 * flickAmp) + (0.18 * flickAmp) * sin(params.time * 7.1 + d * 11.0);
-  return vec3f(1.0, 0.44, 0.18) * haze * flick;
 }
 
 fn get_light_transmittance(pos: vec3f, lightDir: vec3f) -> f32 {
@@ -1432,253 +1082,75 @@ fn get_light_transmittance(pos: vec3f, lightDir: vec3f) -> f32 {
   return exp(-tau);
 }
 
-// HEMISPHERE GI - Sample upward in multiple directions to find actual fire
-fn get_volume_lighting(pos: vec3f) -> vec3f {
-    var totalLight = vec3f(0.0);
-
-    // Sample directions in a hemisphere above the floor point
-    // This finds light from wherever the fire actually IS
-    let dirs = array<vec3f, 3>(
-        vec3f(0.0, 1.0, 0.0),     // Straight up
-        vec3f(0.5, 0.866, 0.0),   // Forward-up
-        vec3f(-0.5, 0.866, 0.0)   // Back-up
-    );
-
-    for (var s = 0; s < 3; s++) {
-      let dir = normalize(dirs[s]);
-
-      // March upward from floor, find any fire along this direction
-      var t = 0.05;
-      var transmittance = 1.0;
-
-      for (var i = 0; i < 8; i++) {
-        if (transmittance < 0.02) { break; }
-        let p = pos + dir * t;
-        let uv = to_volume_uv(p);
-        let m = sample_medium_world(p);
-        let fuel = m.z;
-        let temp = m.x;
-        let soot = m.y;
-
-        var reaction = smoothstep(params.T_ignite, params.T_burn, temp);
-        let fuelGate = 0.25 + 0.75 * smoothstep(0.0, 0.10, fuel);
-        reaction *= fuelGate;
-
-        // Fire emits light downward to floor
-        if (reaction > 0.01) {
-          let emission = getBlackbodyColor(temp) * (params.emission * 0.12) * reaction;
-          let atten = 1.0 / (1.0 + t * t * 5.0);
-          totalLight += emission * atten * transmittance * 0.2;
-        }
-
-        // Smoke blocks light
-        let hot = smoothstep(0.35, 0.7, temp);
-        let cool = smoothstep(params.T_hazeStart, params.T_hazeFull, 1.0 - temp);
-        let height = smoothstep(0.22, 0.92, uv.y);
-        let sootVis = mix(1.0, 0.25, hot);
-        let sootRaw = soot * sootVis;
-        let hazeRaw = soot * cool * height;
-        let sootOpt = 1.0 - exp(-sootRaw * 0.35);
-        let hazeOpt = 1.0 - exp(-hazeRaw * 0.12);
-        let thickness = max(0.25, params.smokeThickness);
-        let darkness = clamp(params.smokeDarkness, 0.0, 1.0);
-        let absorption = params.absorption * thickness * (0.65 + 0.7 * darkness);
-        let scattering = params.scattering * thickness * (0.85 - 0.55 * darkness);
-        let sigmaA = sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12;
-        let sigmaS = sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55;
-        transmittance *= exp(-(sigmaA + sigmaS) * 0.1 * 0.3);
-
-        t += 0.1;
-      }
-    }
-
-    return totalLight * 0.5;
+fn sd_box_local(p: vec3f, b: vec3f) -> f32 {
+  let q = abs(p) - b;
+  return length(max(q, vec3f(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
 }
 
-fn intersectAABB(ro: vec3f, rd: vec3f, bmin: vec3f, bmax: vec3f) -> vec2f {
-    let tMin = (bmin - ro) / rd; let tMax = (bmax - ro) / rd;
-    let t1 = min(tMin, tMax); let t2 = max(tMin, tMax);
-    return vec2f(max(max(t1.x, t1.y), t1.z), min(min(t2.x, t2.y), t2.z));
+fn sd_sphere_local(p: vec3f, r: f32) -> f32 {
+  return length(p) - r;
 }
 
-fn get_floor_material(p: vec3f, ro: vec3f) -> vec3f {
-    let uv = p.xz;
-    let sootDep = clamp(sample_soot_floor(uv), 0.0, 1.0);
-    let sootVis = pow(clamp(sootDep * 2.4, 0.0, 1.0), 0.72);
-    let contact = floor_contact_mask(p);
-    let baseAlbedoTex = sample_floor_albedo_layered(uv);
-    let baseRoughTex = clamp(sample_floor_roughness_layered(uv), 0.0, 1.0);
-    let baseNormalTex = sample_floor_normal_layered(uv);
-
-    let macroTone = cheap_noise(vec3f(uv * 2.6 + vec2f(0.7, -0.4), 4.2)) * 0.5 + 0.5;
-    let microTone = cheap_noise(vec3f(uv * 18.0 + vec2f(5.0, 3.0), 6.8)) * 0.5 + 0.5;
-    var albedo = baseAlbedoTex * mix(0.83, 1.12, macroTone * 0.72 + microTone * 0.28);
-
-    let sootTint = vec3f(0.08, 0.075, 0.07);
-    let charTint = vec3f(0.095, 0.086, 0.08);
-    let charStrength = clamp(params.floorCharStrength, 0.0, 2.0);
-    albedo = mix(albedo, albedo * 0.72 + charTint * 0.28, contact * 0.4 * charStrength);
-    let sootDarkening = clamp((sootVis * 0.72 + contact * 0.34) * max(0.0, params.floorSootDarkening), 0.0, 0.95);
-    let stainedAlbedo = mix(albedo, albedo * (1.0 - sootDarkening) + sootTint * sootDarkening, sootDarkening);
-    let nMicro = floor_micro_normal(uv, sootDep);
-    let normalStrength = clamp(params.floorNormalStrength, 0.0, 2.0);
-    let microStrength = clamp(params.floorMicroStrength, 0.0, 2.0);
-    var n = normalize(mix(vec3f(0.0, 1.0, 0.0), baseNormalTex, normalStrength * 0.75));
-    n = normalize(mix(n, nMicro, (0.18 + sootVis * 0.24) * microStrength));
-    let v = normalize(ro - p);
-    let l = normalize(vec3f(0.5, 0.24, 0.5) - p);
-    let h = normalize(v + l);
-
-    let fireBounceGain = max(0.0, params.floorFireBounce);
-    let cacheLight = sample_radiance_cache(p);
-    let gi = get_volume_lighting(p) + fire_light_approx(p) * fireBounceGain + cacheLight * (0.35 + 0.65 * fireBounceGain);
-    let giStrength = dot(gi, vec3f(0.2126, 0.7152, 0.0722));
-    let baseRough = clamp(baseRoughTex * 0.88 + 0.08, 0.08, 0.97);
-    let sootRoughness = clamp(params.floorSootRoughness, 0.0, 2.0);
-    let roughness = clamp(baseRough + (sootVis * 0.28 + contact * 0.24) * sootRoughness, 0.08, 0.99);
-    let alpha = max(0.04, roughness * roughness);
-    let NdotL = max(dot(n, l), 0.0);
-    let NdotV = max(dot(n, v), 0.0);
-    let NdotH = max(dot(n, h), 0.0);
-    let VdotH = max(dot(v, h), 0.0);
-    let f0 = mix(vec3f(0.024), vec3f(0.045), smoothstep(0.08, 0.5, sootDep));
-    let F = fresnel_schlick(VdotH, f0);
-    let a2 = alpha * alpha;
-    let denom = max(1e-4, NdotH * NdotH * (a2 - 1.0) + 1.0);
-    let D = a2 / (3.14159 * denom * denom);
-    let k = roughness + 1.0;
-    let k2 = (k * k) * 0.125;
-    let Gv = NdotV / max(1e-4, NdotV * (1.0 - k2) + k2);
-    let Gl = NdotL / max(1e-4, NdotL * (1.0 - k2) + k2);
-    let G = Gv * Gl;
-    let specTerm = (D * G) / max(1e-4, 4.0 * NdotV * NdotL);
-    let specular = F * specTerm * (0.03 + giStrength * 0.6) * NdotL * mix(1.0, 0.42, sootVis) * max(0.0, params.floorSpecular);
-
-    let contactOcclusion = 1.0 - contact * 0.45 * clamp(params.floorContactShadow, 0.0, 1.5);
-    let ambient = vec3f(0.028) * max(0.0, params.floorAmbient);
-    let diffuse = stainedAlbedo * gi * (0.82 + 0.18 * NdotL) * contactOcclusion;
-    return diffuse + ambient * stainedAlbedo * (0.9 - sootVis * 0.25) + specular;
+fn sd_capsule_local(p: vec3f, a: vec3f, b: vec3f, r: f32) -> f32 {
+  let pa = p - a;
+  let ba = b - a;
+  let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+  return length(pa - ba * h) - r;
 }
 
-fn get_floor_material_fast(p: vec3f, ro: vec3f) -> vec3f {
-    let uv = p.xz;
-    let sootDep = clamp(sample_soot_floor(uv), 0.0, 1.0);
-    let sootVis = pow(clamp(sootDep * 2.4, 0.0, 1.0), 0.72);
-    let contact = floor_contact_mask(p);
-    let baseAlbedoTex = sample_floor_albedo_layered(uv);
-    let baseRoughTex = clamp(sample_floor_roughness_layered(uv), 0.0, 1.0);
-    let tone = cheap_noise(vec3f(uv * 3.0 + vec2f(0.6, -0.9), 5.2)) * 0.5 + 0.5;
-    var baseAlbedo = baseAlbedoTex * mix(0.86, 1.1, tone);
-    let charTint = vec3f(0.095, 0.086, 0.08);
-    let charStrength = clamp(params.floorCharStrength, 0.0, 2.0);
-    baseAlbedo = mix(baseAlbedo, baseAlbedo * 0.74 + charTint * 0.26, contact * 0.35 * charStrength);
-    let sootDarkening = clamp((sootVis * 0.72 + contact * 0.4) * max(0.0, params.floorSootDarkening), 0.0, 0.92);
-    let sootTint = vec3f(0.08, 0.075, 0.07);
-    let albedo = mix(baseAlbedo, baseAlbedo * (1.0 - sootDarkening) + sootTint * sootDarkening, sootDarkening);
-    let nMap = sample_floor_normal_layered(uv);
-    let n = normalize(mix(vec3f(0.0, 1.0, 0.0), nMap, 0.55 * clamp(params.floorNormalStrength, 0.0, 2.0)));
-    let v = normalize(ro - p);
-    let l = normalize(vec3f(0.5, 0.18, 0.5) - p);
-    let h = normalize(v + l);
-    let sootRoughness = clamp(params.floorSootRoughness, 0.0, 2.0);
-    let roughness = clamp(baseRoughTex * 0.88 + 0.1 + (sootVis * 0.2 + contact * 0.12) * sootRoughness, 0.16, 0.99);
-    let shininess = mix(110.0, 9.0, roughness);
-    let NdotL = max(dot(n, l), 0.0);
-    let specular = pow(max(dot(n, h), 0.0), shininess) * NdotL * mix(0.03, 0.008, sootVis) * max(0.0, params.floorSpecular);
-    let heatMask = clamp(sootVis * 0.85 + contact * 0.65, 0.0, 1.0);
-    let cacheLight = sample_radiance_cache(p);
-    let fireBounce = (fire_light_approx(p) + cacheLight * 0.9) * (0.48 + 0.52 * heatMask) * max(0.0, params.floorFireBounce);
-    let ambient = vec3f(0.023) * max(0.0, params.floorAmbient);
-    let contactOcclusion = 1.0 - contact * 0.4 * clamp(params.floorContactShadow, 0.0, 1.5);
-    return albedo * (ambient + fireBounce * contactOcclusion * (0.35 + 0.65 * NdotL)) + vec3f(specular);
+fn world_occluder_sdf(p: vec3f) -> f32 {
+  var d = 1e6;
+
+  d = min(d, get_wood_sdf(p));
+  d = min(d, sd_box_local(p - vec3f(0.5, 0.04, 0.5), vec3f(0.8, 0.04, 0.8)));
+  d = min(d, sd_sphere_local(p - vec3f(1.08, 0.18, 0.26), 0.16));
+  d = min(d, sd_box_local(p - vec3f(-0.06, 0.13, 0.34), vec3f(0.13, 0.13, 0.13)));
+  d = min(d, sd_capsule_local(p, vec3f(0.34, 0.05, -0.1), vec3f(0.34, 0.29, -0.1), 0.1));
+  d = min(d, sd_box_local(p - vec3f(0.5, 3.25, -3.4), vec3f(12.0, 4.0, 0.03)));
+  d = min(d, p.y);
+  return d;
+}
+
+fn intersect_occluders(ro: vec3f, rd: vec3f, maxT: f32) -> f32 {
+  var t = 0.02;
+  for (var i = 0; i < 84; i++) {
+    if (t > maxT) { break; }
+    let p = ro + rd * t;
+    let d = world_occluder_sdf(p);
+    if (d < 0.0015) { return t; }
+    t += clamp(d * 0.9, 0.008, 0.22);
+  }
+  return maxT;
 }
 
 @fragment fn frag_main(in: VertexOutput) -> @location(0) vec4f {
-  let ro = params.cameraPos.xyz; let fwd = normalize(params.targetPos.xyz - ro);
-  let right = normalize(cross(vec3f(0.0, 1.0, 0.0), fwd)); let up = cross(fwd, right);
-  let rd = normalize(fwd + right * (in.uv.x - 0.5) * 2.0 + up * (in.uv.y - 0.5) * 2.0);
-  let jitter = fract(sin(dot(in.uv + fract(params.time * 0.05), vec2f(12.9898, 78.233))) * 43758.5453);
+  let ro = params.cameraPos.xyz;
+  let fwd = safe_norm(params.targetPos.xyz - ro, vec3f(0.0, 0.0, -1.0));
+  // Use a right-handed camera basis matching the Three.js world render.
+  let rightRaw = cross(fwd, vec3f(0.0, 1.0, 0.0));
+  let rightFallback = cross(fwd, vec3f(1.0, 0.0, 0.0));
+  let right = safe_norm(select(rightRaw, rightFallback, dot(rightRaw, rightRaw) < 1e-6), vec3f(1.0, 0.0, 0.0));
+  let up = safe_norm(cross(right, fwd), vec3f(0.0, 1.0, 0.0));
+  let aspect = max(0.001, params.cameraAspect);
+  let tanHalfFov = max(0.05, params.cameraTanHalfFov);
+  let ndc = (in.uv - 0.5) * 2.0;
+  let rd = safe_norm(fwd + right * (ndc.x * aspect * tanHalfFov) + up * (ndc.y * tanHalfFov), fwd);
+  let jitter = fract(sin(dot(in.uv, vec2f(12.9898, 78.233))) * 43758.5453);
 
   let lightDir = normalize(vec3f(0.3, 1.0, 0.4));
-  var bgCol = vec3f(0.22, 0.22, 0.24); // Medium gray background
-
-  let maxTraceDist = 5.5;
-  var t_floor = -1.0;
-  if (rd.y < -0.0001) {
-    let tf = -ro.y / rd.y;
-    if (tf > 0.0 && tf < maxTraceDist) {
-      t_floor = tf;
-    }
-  }
-
-  // Surface hits are solved in world space, independent of the sim AABB.
-  var tWood = maxTraceDist + 1.0;
-  var woodColor = vec3f(0.0);
-  if (params.sceneType == 0.0 || params.sceneType == 4.0) {
-    var tS = 0.02;
-    for(var i=0; i<96; i++) {
-      if (tS > maxTraceDist) { break; }
-      let p = ro + rd * tS;
-      let d = get_wood_sdf(p);
-      if (d < 0.0004) {
-        tWood = tS;
-        let woodCol = mix(vec3f(0.12, 0.07, 0.03), vec3f(0.25, 0.15, 0.08), sin(length(p.xz-0.5)*120.0 + p.y*35.0)*0.5+0.5);
-        let gi = get_volume_lighting(p) + fire_light_approx(p) * 0.75 + sample_radiance_cache(p) * 0.9;
-        let ambient = vec3f(0.01);
-        woodColor = woodCol * gi * 3.0 + woodCol * ambient;
-        break;
-      }
-      tS += max(d * 0.92, 0.003);
-    }
-  }
-
-  var tWall = maxTraceDist + 1.0;
-  var wallColor = vec3f(0.0);
-  var tW = 0.02;
-  for(var i=0; i<96; i++) {
-    if (tW > maxTraceDist) { break; }
-    let p = ro + rd * tW;
-    let d = get_wall_sdf(p);
-    if (d < 0.001) {
-      tWall = tW;
-      let n = get_wall_normal(p);
-      let wallCol = vec3f(0.75, 0.72, 0.68);
-      let gi = get_volume_lighting(p) + fire_light_approx(p) * 0.7 + sample_radiance_cache(p) * 0.85;
-      let ambient = vec3f(0.015);
-      let toFire = normalize(vec3f(0.5, 0.3, 0.5) - p);
-      let facing = max(0.0, dot(n, toFire));
-      wallColor = wallCol * gi * 2.5 * (0.3 + facing * 0.7) + wallCol * ambient;
-      break;
-    }
-    tW += max(d * 0.9, 0.005);
-  }
-
-  var tScene = maxTraceDist;
-  var surfaceCol = bgCol;
-  if (t_floor > 0.0 && t_floor < tScene) {
-    tScene = t_floor;
-    surfaceCol = get_floor_material(ro + rd * t_floor, ro);
-  }
-  if (tWall < tScene) {
-    tScene = tWall;
-    surfaceCol = wallColor;
-  }
-  if (tWood < tScene) {
-    tScene = tWood;
-    surfaceCol = woodColor;
-  }
-
-  let baseSteps = 160;
-  let rayFactor = clamp(tScene / 1.6, 0.65, 1.75);
-  let steps = clamp(i32(round(f32(baseSteps) * params.stepQuality * rayFactor)), 1, 420);
-  let stepSize = max(1e-4, tScene / f32(steps));
-  var pos = ro + rd * (stepSize * (0.5 + jitter));
+  let worldHitT = intersect_occluders(ro, rd, 6.0);
+  let maxTraceDist = min(5.5, worldHitT);
+  let baseSteps = 220;
+  let steps = clamp(i32(round(f32(baseSteps) * params.stepQuality)), 1, 720);
+  let baseStep = max(1e-4, maxTraceDist / f32(steps));
+  var t = baseStep * (0.5 + jitter);
   var accumCol = vec3f(0.0); var transmittance = 1.0; let phaseSun = phase_function(dot(rd, lightDir), params.anisotropyG);
   var cachedSunTrans = 1.0;
   var shadowRefreshCountdown = 0;
 
-  for (var i = 0; i < steps; i++) {
-    if (transmittance < 0.005) { break; }
+  for (var i = 0; i < steps * 3; i++) {
+    if (transmittance < 0.005 || t > maxTraceDist) { break; }
+    let pos = ro + rd * t;
     let uv = to_volume_uv(pos);
     let m = sample_medium_world(pos);
     let soot = m.y;
@@ -1686,7 +1158,7 @@ fn get_floor_material_fast(p: vec3f, ro: vec3f) -> vec3f {
     let fuel = m.z;
     let mediumMask = m.w;
     if (mediumMask <= 0.00001) {
-      pos += rd * stepSize * 2.2;
+      t += baseStep * 2.6;
       continue;
     }
     {
@@ -1716,9 +1188,11 @@ fn get_floor_material_fast(p: vec3f, ro: vec3f) -> vec3f {
       let hazeOpt = 1.0 - exp(-hazeRaw * 0.12);
       let activity = sootOpt + hazeOpt + reaction;
       let emptyThreshold = 0.0018 / max(0.5, params.stepQuality);
+      let emissiveFocus = clamp(max(reaction, baseReaction), 0.0, 1.0);
+      let localStep = clamp(baseStep * mix(1.0, 0.24, emissiveFocus), baseStep * 0.2, baseStep * 1.2);
 
       if (activity < emptyThreshold) {
-        pos += rd * stepSize * 2.2;
+        t += max(baseStep * 1.4, localStep * 1.9);
         continue;
       }
 
@@ -1739,8 +1213,9 @@ fn get_floor_material_fast(p: vec3f, ro: vec3f) -> vec3f {
         let microSmoke = clamp(1.0 + detail * 0.06, 0.85, 1.15);
         let sigmaA = (sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12) * microSmoke;
         let sigmaS = (sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55) * microSmoke;
-        let sigmaT = sigmaA + sigmaS;
-        let stepTrans = exp(-sigmaT * stepSize);
+        // Keep a small in-flame extinction term so emissive sheets integrate smoothly.
+        let sigmaT = max(1e-5, sigmaA + sigmaS + reaction * 0.045);
+        let stepTrans = exp(-sigmaT * localStep);
 
         if (shadowRefreshCountdown <= 0) {
           cachedSunTrans = get_light_transmittance(pos, lightDir);
@@ -1765,18 +1240,22 @@ fn get_floor_material_fast(p: vec3f, ro: vec3f) -> vec3f {
         let microFlame = clamp(1.0 + detail * 0.18, 0.7, 1.3);
         let reactionEm = reaction * reaction;
         let emission = getBlackbodyColor(temp) * params.emission * reactionEm * shadowTr * microFlame;
-        accumCol += emission * transmittance * stepSize;
+        let emissionIntegral = emission * ((1.0 - stepTrans) / max(1e-4, sigmaT));
+        accumCol += emissionIntegral * transmittance;
 
         transmittance *= stepTrans;
+        t += localStep;
+      } else {
+        t += baseStep;
       }
     }
-    pos += rd * stepSize;
   }
 
-  let glowProbe = sample_radiance_cache(ro + rd * 0.9) * 0.25;
-  let outsideGlow = (fire_glow_along_ray(ro, rd) + glowProbe) * transmittance;
-  let mapped = tonemap_aces((accumCol + transmittance * surfaceCol + outsideGlow) * params.exposure);
-  return vec4f(pow(mapped, vec3f(1.0 / params.gamma)), 1.0);
+  let mapped = tonemap_aces(accumCol * params.exposure);
+  let outColor = pow(mapped, vec3f(1.0 / params.gamma));
+  let luma = dot(outColor, vec3f(0.2126, 0.7152, 0.0722));
+  let alpha = clamp(max(1.0 - transmittance, smoothstep(0.02, 0.12, luma)), 0.0, 1.0);
+  return vec4f(outColor, alpha);
 }
 `;
 
@@ -2138,7 +1617,7 @@ const FLOOR_LIGHTING_DEFAULTS: FloorLightingParams = {
   floorAmbient: 0.55,
   lightingFireIntensity: 1.75,
   lightingFireFalloff: 1.1,
-  lightingFlicker: 0.7,
+  lightingFlicker: 0.2,
   lightingGlow: 1.35,
 };
 
@@ -2152,7 +1631,7 @@ type DiagnosticsTab = 'runtime' | 'performance' | 'overlays' | 'logs';
 type QualityMode = 'realtime' | 'accurate';
 type PresetSlot = 'A' | 'B';
 
-type DeckRailSection = 'home' | 'flame' | 'smoke' | 'convection' | 'turbulence' | 'floor' | 'lighting' | 'library';
+type DeckRailSection = 'home' | 'flame' | 'smoke' | 'convection' | 'turbulence' | 'floor' | 'lighting' | 'resolution' | 'library';
 
 interface ParameterSpec {
   key: EditableParamKey;
@@ -2241,7 +1720,7 @@ const PARAM_SPECS: ParameterSpec[] = [
   { key: 'floorAmbient', label: 'Floor Ambient', group: 'optics', min: 0.0, max: 2.0, step: 0.01, unit: 'x', hint: 'Base ambient visibility for the floor.' },
   { key: 'lightingFireIntensity', label: 'Fire Light Intensity', group: 'optics', min: 0.0, max: 4.0, step: 0.01, unit: 'x', hint: 'Global analytic fire-light multiplier outside volume bounds.' },
   { key: 'lightingFireFalloff', label: 'Fire Light Falloff', group: 'optics', min: 0.15, max: 3.0, step: 0.01, unit: 'x', hint: 'Distance falloff scale for analytic fire light.' },
-  { key: 'lightingFlicker', label: 'Fire Light Flicker', group: 'optics', min: 0.0, max: 1.0, step: 0.01, unit: 'mix', hint: 'Temporal flicker amplitude for fire light/glow.' },
+  { key: 'lightingFlicker', label: 'Sky Day/Night Blend', group: 'optics', min: 0.0, max: 1.0, step: 0.01, unit: 'mix', hint: '0 = daytime sky, 1 = nighttime sky.' },
   { key: 'lightingGlow', label: 'Fire Glow Strength', group: 'optics', min: 0.0, max: 3.0, step: 0.01, unit: 'x', hint: 'Out-of-volume atmospheric glow around fire.' },
   { key: 'exposure', label: 'Exposure', group: 'optics', min: 0.1, max: 10.0, step: 0.05, unit: 'EV', hint: 'Post-tonemap gain.' },
   { key: 'gamma', label: 'Gamma', group: 'optics', min: 0.1, max: 4, step: 0.05, unit: 'gamma', hint: 'Output transfer curve.' },
@@ -2292,132 +1771,15 @@ const formatWithStep = (value: number, step: number) => {
   return value.toFixed(decimals);
 };
 
-const MAX_INTERNAL_RENDER_PIXELS = 1600 * 900;
+const MAX_INTERNAL_RENDER_PIXELS = 3840 * 2160;
 
-const getRenderScale = (width: number, height: number) => {
+const getRenderScale = (width: number, height: number, pixelRatio: number) => {
   const safeWidth = Math.max(1, width);
   const safeHeight = Math.max(1, height);
-  const pixelCount = safeWidth * safeHeight;
+  const safePixelRatio = Math.max(1, pixelRatio);
+  const pixelCount = safeWidth * safeHeight * safePixelRatio * safePixelRatio;
   if (pixelCount <= MAX_INTERNAL_RENDER_PIXELS) return 1;
   return Math.sqrt(MAX_INTERNAL_RENDER_PIXELS / pixelCount);
-};
-
-const createSolidRgbaTexture = (
-  device: GPUDevice,
-  rgba: [number, number, number, number],
-  format: string = 'rgba8unorm'
-) => {
-  const textureUsage = (window as any).GPUTextureUsage;
-  const texture = (device as any).createTexture({
-    size: [1, 1],
-    format,
-    usage: textureUsage.TEXTURE_BINDING | textureUsage.COPY_DST | textureUsage.RENDER_ATTACHMENT,
-  });
-  const pixels = new Uint8Array(rgba);
-  (device.queue as any).writeTexture(
-    { texture },
-    pixels,
-    { bytesPerRow: 4, rowsPerImage: 1 },
-    { width: 1, height: 1 }
-  );
-  return texture as GPUTexture;
-};
-
-const createTextureFromBitmap = (device: GPUDevice, bitmap: ImageBitmap, format: string) => {
-  const textureUsage = (window as any).GPUTextureUsage;
-  const texture = (device as any).createTexture({
-    size: [bitmap.width, bitmap.height],
-    format,
-    usage: textureUsage.TEXTURE_BINDING | textureUsage.COPY_DST | textureUsage.RENDER_ATTACHMENT,
-  });
-  (device.queue as any).copyExternalImageToTexture(
-    { source: bitmap },
-    { texture },
-    { width: bitmap.width, height: bitmap.height }
-  );
-  return texture as GPUTexture;
-};
-
-const loadFloorMaterialTextures = async (device: GPUDevice) => {
-  const textures: GPUTexture[] = [];
-  let fallbackUsed = false;
-  const baseUrl = (import.meta as any).env?.BASE_URL ?? '/';
-  const normalizedBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
-  const assetUrl = (path: string) => new URL(path, `${window.location.origin}${normalizedBase}`).toString();
-  const sampler = (device as any).createSampler({
-    magFilter: 'linear',
-    minFilter: 'linear',
-    mipmapFilter: 'linear',
-    addressModeU: 'repeat',
-    addressModeV: 'repeat',
-    maxAnisotropy: 16,
-  }) as GPUSampler;
-  try {
-    const albedoUrl = assetUrl('textures/concrete016/Concrete016_1K-JPG_Color.jpg');
-    const roughnessUrl = assetUrl('textures/concrete016/Concrete016_1K-JPG_Roughness.jpg');
-    const normalUrl = assetUrl('textures/concrete016/Concrete016_1K-JPG_NormalGL.jpg');
-
-    const [albedoResp, roughnessResp, normalResp] = await Promise.all([
-      fetch(albedoUrl),
-      fetch(roughnessUrl),
-      fetch(normalUrl),
-    ]);
-
-    if (!albedoResp.ok || !roughnessResp.ok || !normalResp.ok) {
-      throw new Error('Failed to fetch floor PBR textures');
-    }
-
-    const isImage = (resp: Response) => (resp.headers.get('content-type') ?? '').startsWith('image/');
-    if (!isImage(albedoResp) || !isImage(roughnessResp) || !isImage(normalResp)) {
-      throw new Error('Floor PBR fetch returned non-image content');
-    }
-
-    const [albedoBlob, roughnessBlob, normalBlob] = await Promise.all([
-      albedoResp.blob(),
-      roughnessResp.blob(),
-      normalResp.blob(),
-    ]);
-
-    const [albedoBitmap, roughnessBitmap, normalBitmap] = await Promise.all([
-      createImageBitmap(albedoBlob),
-      createImageBitmap(roughnessBlob),
-      createImageBitmap(normalBlob),
-    ]);
-
-    const albedo = createTextureFromBitmap(device, albedoBitmap, 'rgba8unorm-srgb');
-    const roughness = createTextureFromBitmap(device, roughnessBitmap, 'rgba8unorm');
-    const normal = createTextureFromBitmap(device, normalBitmap, 'rgba8unorm');
-    textures.push(albedo, roughness, normal);
-
-    albedoBitmap.close();
-    roughnessBitmap.close();
-    normalBitmap.close();
-    console.info('[FloorPBR] Loaded floor material textures.', { albedoUrl, roughnessUrl, normalUrl });
-  } catch (error) {
-    fallbackUsed = true;
-    console.warn('[FloorPBR] Falling back to solid floor material.', error);
-    // Fallback keeps rendering functional when static assets are unavailable.
-    textures.push(
-      createSolidRgbaTexture(device, [112, 110, 108, 255], 'rgba8unorm-srgb'),
-      createSolidRgbaTexture(device, [200, 200, 200, 255]),
-      createSolidRgbaTexture(device, [128, 255, 128, 255])
-    );
-  }
-
-  const [albedo, roughness, normal] = textures;
-  return {
-    material: {
-      albedoView: albedo.createView(),
-      roughnessView: roughness.createView(),
-      normalView: normal.createView(),
-      sampler,
-    } as FloorMaterialTextures,
-    fallbackUsed,
-    dispose: () => {
-      for (const texture of textures) (texture as any).destroy();
-      (sampler as any).destroy?.();
-    },
-  };
 };
 
 const createSeededRandom = (seed: number) => {
@@ -2456,8 +1818,85 @@ const downloadJson = (filename: string, payload: unknown) => {
   URL.revokeObjectURL(url);
 };
 
+interface WorldRuntime {
+  renderer: THREE.WebGPURenderer;
+  scene: THREE.Scene;
+  camera: THREE.PerspectiveCamera;
+  floorMaterial: THREE.MeshPhysicalMaterial;
+  wallMaterial: THREE.MeshPhysicalMaterial;
+  keyLight: THREE.DirectionalLight;
+  fillLight: THREE.HemisphereLight;
+  fireLight: THREE.PointLight;
+  textures: THREE.Texture[];
+}
+
+const addWorldProps = (scene: THREE.Scene) => {
+  const baseMaterial = new THREE.MeshPhysicalMaterial({
+    color: 0x6e747c,
+    roughness: 0.5,
+    metalness: 0.08,
+  });
+
+  const stoneMaterial = new THREE.MeshPhysicalMaterial({
+    color: 0x5b6066,
+    roughness: 0.88,
+    metalness: 0.02,
+  });
+
+  const reflectiveMaterial = new THREE.MeshPhysicalMaterial({
+    color: 0xffffff,
+    roughness: 0.06,
+    metalness: 1.0,
+    clearcoat: 0.22,
+    clearcoatRoughness: 0.12,
+  });
+
+  const pad = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.08, 1.6), baseMaterial);
+  pad.position.set(0.5, 0.04, 0.5);
+  pad.castShadow = true;
+  pad.receiveShadow = true;
+  scene.add(pad);
+
+  const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.16, 48, 48), reflectiveMaterial);
+  sphere.position.set(1.08, 0.18, 0.26);
+  sphere.castShadow = true;
+  sphere.receiveShadow = true;
+  scene.add(sphere);
+
+  const box = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.26, 0.26), stoneMaterial);
+  box.position.set(-0.06, 0.13, 0.34);
+  box.castShadow = true;
+  box.receiveShadow = true;
+  scene.add(box);
+
+  const capsule = new THREE.Mesh(new THREE.CapsuleGeometry(0.1, 0.24, 14, 24), baseMaterial);
+  capsule.position.set(0.34, 0.17, -0.1);
+  capsule.castShadow = true;
+  capsule.receiveShadow = true;
+  scene.add(capsule);
+};
+
+const loadTextureSafe = async (
+  loader: THREE.TextureLoader,
+  url: string,
+  colorSpace: THREE.ColorSpace,
+): Promise<THREE.Texture | null> => {
+  try {
+    const texture = await loader.loadAsync(url);
+    texture.colorSpace = colorSpace;
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.anisotropy = 8;
+    return texture;
+  } catch {
+    return null;
+  }
+};
+
 const FluidSimulation: React.FC = () => {
+  const worldCanvasRef = useRef<HTMLCanvasElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const worldRuntimeRef = useRef<WorldRuntime | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [controlsVisible, setControlsVisible] = useState(true);
@@ -2483,7 +1922,8 @@ const FluidSimulation: React.FC = () => {
     matter: false,
     optics: false,
   });
-  const [dimensions, setDimensions] = useState({ width: window.innerWidth, height: window.innerHeight });
+  const readPixelRatio = () => Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
+  const [dimensions, setDimensions] = useState({ width: window.innerWidth, height: window.innerHeight, pixelRatio: readPixelRatio() });
   const [gridSize, setGridSize] = useState(128);
   const [runtimeResolutionScale, setRuntimeResolutionScale] = useState(1);
   const [simParams, setSimParams] = useState<SimParamState>({ ...INITIAL_PARAMS });
@@ -2499,15 +1939,15 @@ const FluidSimulation: React.FC = () => {
     turbulenceCharacter: deriveTurbulenceCharacterT(INITIAL_PARAMS),
   }));
   const renderScale = useMemo(
-    () => clamp(getRenderScale(dimensions.width, dimensions.height) * runtimeResolutionScale, 0.35, 1.0),
-    [dimensions.height, dimensions.width, runtimeResolutionScale]
+    () => clamp(getRenderScale(dimensions.width, dimensions.height, dimensions.pixelRatio) * runtimeResolutionScale, 0.35, 1.0),
+    [dimensions.height, dimensions.pixelRatio, dimensions.width, runtimeResolutionScale]
   );
   const internalCanvasSize = useMemo(
     () => ({
-      width: Math.max(1, Math.round(dimensions.width * renderScale)),
-      height: Math.max(1, Math.round(dimensions.height * renderScale)),
+      width: Math.max(1, Math.round(dimensions.width * dimensions.pixelRatio * renderScale)),
+      height: Math.max(1, Math.round(dimensions.height * dimensions.pixelRatio * renderScale)),
     }),
-    [dimensions.height, dimensions.width, renderScale]
+    [dimensions.height, dimensions.pixelRatio, dimensions.width, renderScale]
   );
   const cameraRef = useRef({ theta: 1.625, phi: 1.35, radius: 1.25, target: [0.5, 0.4, 0.5] as [number, number, number], pos: [0.45, 0.38, 1.3] as [number, number, number] });
   const interactionRef = useRef({ isDragging: false, lastX: 0, lastY: 0, button: 0 });
@@ -2517,7 +1957,6 @@ const FluidSimulation: React.FC = () => {
   const smokeEnabledRef = useRef(isSmokeEnabled);
   const qualityModeRef = useRef(qualityMode);
   const adaptiveStepScaleRef = useRef(1.0);
-  const runtimeResolutionScaleRef = useRef(1.0);
   const stepFramesRef = useRef(0);
   const randomSeedRef = useRef(1337);
   const timelineIdRef = useRef(1);
@@ -2527,7 +1966,6 @@ const FluidSimulation: React.FC = () => {
   useEffect(() => { sceneRef.current = selectedSceneId; }, [selectedSceneId]);
   useEffect(() => { smokeEnabledRef.current = isSmokeEnabled; }, [isSmokeEnabled]);
   useEffect(() => { qualityModeRef.current = qualityMode; }, [qualityMode]);
-  useEffect(() => { runtimeResolutionScaleRef.current = runtimeResolutionScale; }, [runtimeResolutionScale]);
 
   const pushTimeline = useCallback((message: string) => {
     const item: TimelineEvent = { id: timelineIdRef.current, at: Date.now(), message };
@@ -2545,7 +1983,7 @@ const FluidSimulation: React.FC = () => {
   }, [pushTimeline]);
 
   useEffect(() => {
-    const handleResize = () => setDimensions({ width: window.innerWidth, height: window.innerHeight });
+    const handleResize = () => setDimensions({ width: window.innerWidth, height: window.innerHeight, pixelRatio: readPixelRatio() });
     window.addEventListener('resize', handleResize); return () => window.removeEventListener('resize', handleResize);
   }, []);
 
@@ -2715,48 +2153,279 @@ const FluidSimulation: React.FC = () => {
   };
 
   useEffect(() => {
+    const canvas = worldCanvasRef.current;
+    if (!canvas || !navigator.gpu) return;
+
+    let destroyed = false;
+    let rafId = 0;
+    let removeResize = () => {};
+
+    const initWorld = async () => {
+      const renderer = new THREE.WebGPURenderer({
+        canvas,
+        antialias: true,
+        alpha: true,
+      });
+      await renderer.init();
+      if (destroyed) {
+        renderer.dispose();
+        return;
+      }
+
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight, false);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.0;
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      const scene = new THREE.Scene();
+      const skyDay = new THREE.Color(0x9eb6cc);
+      const skyNight = new THREE.Color(0x111a25);
+      const skyMix = new THREE.Color();
+      scene.background = skyDay.clone();
+      scene.fog = new THREE.Fog(0x9eb6cc, 3.5, 26.0);
+
+      const camera = new THREE.PerspectiveCamera(
+        90,
+        window.innerWidth / Math.max(1, window.innerHeight),
+        0.02,
+        120
+      );
+
+      const keyLight = new THREE.DirectionalLight(0xfff2dd, 2.2);
+      keyLight.position.set(-2.6, 4.8, -1.2);
+      keyLight.castShadow = true;
+      keyLight.shadow.mapSize.set(2048, 2048);
+      keyLight.shadow.camera.near = 0.5;
+      keyLight.shadow.camera.far = 40.0;
+      keyLight.shadow.camera.left = -8.0;
+      keyLight.shadow.camera.right = 8.0;
+      keyLight.shadow.camera.top = 8.0;
+      keyLight.shadow.camera.bottom = -8.0;
+      keyLight.shadow.normalBias = 0.02;
+      scene.add(keyLight);
+
+      const fillLight = new THREE.HemisphereLight(0x9fbfe0, 0x2a3038, 0.48);
+      scene.add(fillLight);
+
+      const fireLight = new THREE.PointLight(0xff8a3c, 3.0, 5.0, 1.8);
+      fireLight.position.set(0.5, 0.22, 0.5);
+      fireLight.castShadow = false;
+      scene.add(fireLight);
+
+      const floorGeometry = new THREE.PlaneGeometry(34, 34);
+      floorGeometry.rotateX(-Math.PI / 2);
+      const floorMaterial = new THREE.MeshPhysicalMaterial({
+        color: 0x868b90,
+        roughness: 0.76,
+        metalness: 0.06,
+        clearcoat: 0.12,
+        clearcoatRoughness: 0.44,
+      });
+      const floorMesh = new THREE.Mesh(floorGeometry, floorMaterial);
+      floorMesh.position.set(0.5, 0.0, 0.5);
+      floorMesh.receiveShadow = true;
+      floorMesh.castShadow = false;
+      scene.add(floorMesh);
+
+      const wallMaterial = new THREE.MeshPhysicalMaterial({
+        color: 0x434950,
+        roughness: 0.78,
+        metalness: 0.03,
+      });
+      const wall = new THREE.Mesh(new THREE.PlaneGeometry(24, 8), wallMaterial);
+      wall.position.set(0.5, 3.25, -3.4);
+      wall.receiveShadow = true;
+      wall.castShadow = false;
+      scene.add(wall);
+
+      addWorldProps(scene);
+
+      const loader = new THREE.TextureLoader();
+      const textures: THREE.Texture[] = [];
+      const [albedo, normal, roughness] = await Promise.all([
+        loadTextureSafe(loader, '/textures/concrete016/Concrete016_1K-JPG_Color.jpg', THREE.SRGBColorSpace),
+        loadTextureSafe(loader, '/textures/concrete016/Concrete016_1K-JPG_NormalGL.jpg', THREE.NoColorSpace),
+        loadTextureSafe(loader, '/textures/concrete016/Concrete016_1K-JPG_Roughness.jpg', THREE.NoColorSpace),
+      ]);
+      if (!destroyed) {
+        const repeatX = 18;
+        const repeatY = 18;
+        if (albedo) {
+          albedo.repeat.set(repeatX, repeatY);
+          floorMaterial.map = albedo;
+          floorMaterial.color.setHex(0xffffff);
+          textures.push(albedo);
+        }
+        if (normal) {
+          normal.repeat.set(repeatX, repeatY);
+          floorMaterial.normalMap = normal;
+          floorMaterial.normalScale.set(0.58, 0.58);
+          textures.push(normal);
+        }
+        if (roughness) {
+          roughness.repeat.set(repeatX, repeatY);
+          floorMaterial.roughnessMap = roughness;
+          textures.push(roughness);
+        }
+        floorMaterial.needsUpdate = true;
+      } else {
+        albedo?.dispose();
+        normal?.dispose();
+        roughness?.dispose();
+      }
+
+      worldRuntimeRef.current = {
+        renderer,
+        scene,
+        camera,
+        floorMaterial,
+        wallMaterial,
+        keyLight,
+        fillLight,
+        fireLight,
+        textures,
+      };
+
+      const handleResize = () => {
+        const runtime = worldRuntimeRef.current;
+        if (!runtime) return;
+        const aspect = window.innerWidth / Math.max(1, window.innerHeight);
+        runtime.camera.aspect = aspect;
+        runtime.camera.updateProjectionMatrix();
+        runtime.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        runtime.renderer.setSize(window.innerWidth, window.innerHeight, false);
+      };
+      window.addEventListener('resize', handleResize);
+      removeResize = () => window.removeEventListener('resize', handleResize);
+
+      const renderWorld = () => {
+        const runtime = worldRuntimeRef.current;
+        if (destroyed || !runtime) return;
+
+        const cam = cameraRef.current;
+        runtime.camera.position.set(cam.pos[0], cam.pos[1], cam.pos[2]);
+        runtime.camera.lookAt(cam.target[0], cam.target[1], cam.target[2]);
+
+        const p = paramsRef.current;
+        const dayBlend = clamp(1.0 - p.lightingFlicker, 0.0, 1.0);
+        skyMix.copy(skyNight).lerp(skyDay, dayBlend);
+        runtime.scene.background = skyMix;
+        (runtime.scene.fog as THREE.Fog).color.copy(skyMix);
+        runtime.renderer.toneMappingExposure = clamp(p.exposure * 0.95, 0.45, 1.8);
+
+        runtime.keyLight.intensity = clamp(0.9 + p.floorAmbient * 1.8, 0.55, 3.4);
+        runtime.fillLight.intensity = clamp(0.22 + p.floorAmbient * 1.0, 0.12, 1.5);
+
+        runtime.fireLight.position.set(0.5, 0.22 + p.volumeHeight * 0.12, 0.5);
+        runtime.fireLight.intensity = clamp(0.65 + p.lightingFireIntensity * 0.30 + p.emission * 0.08, 0.4, 8.0);
+        runtime.fireLight.distance = clamp(1.6 + p.lightingFireFalloff * 1.8, 1.2, 8.8);
+
+        runtime.floorMaterial.roughness = clamp(
+          0.22 + (1.0 - p.floorSpecular) * 0.58 + p.floorSootRoughness * 0.08,
+          0.12,
+          0.98
+        );
+        runtime.floorMaterial.metalness = clamp(0.01 + p.floorSpecular * 0.24, 0.0, 0.4);
+        runtime.floorMaterial.clearcoat = clamp(0.05 + p.floorSpecular * 0.36, 0.0, 0.82);
+        runtime.floorMaterial.clearcoatRoughness = clamp(0.82 - p.floorSpecular * 0.68, 0.1, 0.95);
+        runtime.floorMaterial.envMapIntensity = clamp(0.6 + p.floorSpecular * 1.2, 0.2, 2.8);
+
+        runtime.wallMaterial.roughness = clamp(0.62 + p.smokeDarkness * 0.35, 0.45, 0.98);
+        runtime.wallMaterial.metalness = clamp(0.02 + p.floorSpecular * 0.08, 0.0, 0.18);
+
+        runtime.renderer.render(runtime.scene, runtime.camera);
+        rafId = requestAnimationFrame(renderWorld);
+      };
+      renderWorld();
+    };
+
+    initWorld().catch((err) => {
+      if (!destroyed) {
+        setRuntimeWarning(`World pipeline init failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    });
+
+    return () => {
+      destroyed = true;
+      cancelAnimationFrame(rafId);
+      removeResize();
+
+      const runtime = worldRuntimeRef.current;
+      if (runtime) {
+        runtime.textures.forEach((texture) => texture.dispose());
+        runtime.scene.traverse((node) => {
+          const mesh = node as THREE.Mesh;
+          const geometry = mesh.geometry as THREE.BufferGeometry | undefined;
+          if (geometry?.dispose) geometry.dispose();
+          const material = mesh.material as THREE.Material | THREE.Material[] | undefined;
+          if (Array.isArray(material)) material.forEach((entry) => entry?.dispose?.());
+          else material?.dispose?.();
+        });
+        runtime.renderer.dispose();
+        worldRuntimeRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     updateCameraVectors();
     if (!canvasRef.current || !navigator.gpu) { setError(navigator.gpu ? null : "WebGPU not supported"); return; }
     let animationFrameId: number;
     let device: GPUDevice;
     let context: GPUCanvasContext;
-    let disposeFloorMaterial: (() => void) | null = null;
     let isDestroyed = false;
 
     const init = async () => {
       try {
         const adapter = await navigator.gpu.requestAdapter();
         if (!adapter || isDestroyed) throw new Error("No adapter");
-        device = await adapter.requestDevice();
+        const requiredStorageForGrid = gridSize * gridSize * gridSize * 16;
+        const requestedStorageLimit = Math.min(adapter.limits.maxStorageBufferBindingSize, requiredStorageForGrid);
+        const requestedBufferLimit = Math.min(adapter.limits.maxBufferSize, requiredStorageForGrid);
+        try {
+          device = await (adapter as any).requestDevice({
+            requiredLimits: {
+              maxStorageBufferBindingSize: requestedStorageLimit,
+              maxBufferSize: requestedBufferLimit,
+            },
+          });
+        } catch {
+          // Fallback to default limits for older/quirky implementations.
+          device = await adapter.requestDevice();
+        }
         if (isDestroyed) { device.destroy(); return; }
 
-        context = canvasRef.current!.getContext('webgpu') as any;
-        const format = navigator.gpu.getPreferredCanvasFormat();
-        context.configure({ device, format, alphaMode: 'premultiplied' });
-
-        const loadedFloorMaterial = await loadFloorMaterialTextures(device);
-        if (loadedFloorMaterial.fallbackUsed) {
-          pushTimeline('Floor PBR load failed; using fallback floor material.');
-        } else {
-          pushTimeline('Floor PBR textures loaded.');
-        }
-        disposeFloorMaterial = loadedFloorMaterial.dispose;
-        if (isDestroyed) {
-          disposeFloorMaterial?.();
+        const deviceLimits = ((device as any).limits ?? adapter.limits) as GPUSupportedLimits;
+        const maxStorageBinding = deviceLimits.maxStorageBufferBindingSize ?? adapter.limits.maxStorageBufferBindingSize;
+        const maxDimByStorageBinding = Math.floor(Math.cbrt(maxStorageBinding / 16));
+        const supportedGrid = [256, 192, 128, 64].find((candidate) => candidate <= maxDimByStorageBinding) ?? 64;
+        if (supportedGrid !== gridSize) {
+          pushTimeline(`Grid ${gridSize} exceeded max storage binding; falling back to ${supportedGrid}.`);
+          setGridSize(supportedGrid);
           device.destroy();
           return;
         }
 
-        const transport = new FluidTransport(device, gridSize, loadedFloorMaterial.material);
+        context = canvasRef.current!.getContext('webgpu') as any;
+        const format = navigator.gpu.getPreferredCanvasFormat();
+        context.configure({ device, format, alphaMode: 'premultiplied' });
+        if (isDestroyed) {
+          device.destroy();
+          return;
+        }
+
+        const transport = new FluidTransport(device, gridSize);
         const computePipeline = device.createComputePipeline({ layout: transport.physicsContract.layout, compute: { module: device.createShaderModule({ code: COMPUTE_SHADER }), entryPoint: 'main' } });
-        const sootFloorPipeline = device.createComputePipeline({ layout: transport.floorContract.layout, compute: { module: device.createShaderModule({ code: SOOT_FLOOR_UPDATE_SHADER }), entryPoint: 'main' } });
-        const radianceInjectPipeline = device.createComputePipeline({ layout: transport.radianceInjectContract.layout, compute: { module: device.createShaderModule({ code: RADIANCE_CACHE_INJECT_SHADER }), entryPoint: 'main' } });
-        const radiancePropPipeline = device.createComputePipeline({ layout: transport.radiancePropContract.layout, compute: { module: device.createShaderModule({ code: RADIANCE_CACHE_PROPAGATE_SHADER }), entryPoint: 'main' } });
+        const projectionDivPipeline = device.createComputePipeline({ layout: transport.projectionDivContract.layout, compute: { module: device.createShaderModule({ code: PROJECTION_DIVERGENCE_SHADER }), entryPoint: 'main' } });
+        const projectionJacobiPipeline = device.createComputePipeline({ layout: transport.projectionJacobiContract.layout, compute: { module: device.createShaderModule({ code: PROJECTION_JACOBI_SHADER }), entryPoint: 'main' } });
+        const projectionGradPipeline = device.createComputePipeline({ layout: transport.projectionGradContract.layout, compute: { module: device.createShaderModule({ code: PROJECTION_GRADIENT_SHADER }), entryPoint: 'main' } });
         const renderPipeline = device.createRenderPipeline({ layout: transport.renderContract.layout, vertex: { module: device.createShaderModule({ code: RENDER_SHADER }), entryPoint: 'vert_main' }, fragment: { module: device.createShaderModule({ code: RENDER_SHADER }), entryPoint: 'frag_main', targets: [{ format }] }, primitive: { topology: 'triangle-list' } });
 
         let simFrame = 0;
         let activeRenderGroup = 0;
-        let activeSootFloor = 0;
         let simAccumulatorSeconds = 0;
         let lastTime = performance.now();
         let statsTimer = 0;
@@ -2779,29 +2448,15 @@ const FluidSimulation: React.FC = () => {
               else if (frameTimeMs > 10) nextScale *= 0.96;
               else if (frameTimeMs < 7) nextScale *= 1.04;
               adaptiveStepScaleRef.current = clamp(nextScale, 0.85, 1.0);
-
-              let nextResolutionScale = runtimeResolutionScaleRef.current;
-              if (frameTimeMs > 8.5) nextResolutionScale *= 0.88;
-              else if (frameTimeMs > 6.8) nextResolutionScale *= 0.94;
-              else if (frameTimeMs < 5.4) nextResolutionScale *= 1.03;
-              nextResolutionScale = clamp(nextResolutionScale, 0.35, 1.0);
-              if (Math.abs(nextResolutionScale - runtimeResolutionScaleRef.current) > 0.015) {
-                runtimeResolutionScaleRef.current = nextResolutionScale;
-                setRuntimeResolutionScale(nextResolutionScale);
-              }
             } else {
               adaptiveStepScaleRef.current = 1.0;
-              if (runtimeResolutionScaleRef.current !== 1.0) {
-                runtimeResolutionScaleRef.current = 1.0;
-                setRuntimeResolutionScale(1.0);
-              }
             }
             rafCount = 0;
             dtAccum = 0;
             statsTimer = 0;
           }
           const shouldAdvance = playingRef.current || stepFramesRef.current > 0;
-          const qualityBoost = qualityModeRef.current === 'accurate' ? 1.35 : 1.0;
+          const qualityBoost = qualityModeRef.current === 'accurate' ? 1.5 : 1.0;
           const adaptiveScale = qualityModeRef.current === 'accurate' ? 1.0 : adaptiveStepScaleRef.current;
           const stepQuality = clamp(paramsRef.current.stepQuality * qualityBoost * adaptiveScale, 0.25, 4.0);
 
@@ -2810,7 +2465,9 @@ const FluidSimulation: React.FC = () => {
             timeStep: DEFAULT_TIME_STEP,
             stepQuality,
             scattering: smokeEnabledRef.current ? paramsRef.current.scattering : 0.0,
-            absorption: smokeEnabledRef.current ? paramsRef.current.absorption : 0.0
+            absorption: smokeEnabledRef.current ? paramsRef.current.absorption : 0.0,
+            renderWidth: canvasRef.current?.width ?? window.innerWidth,
+            renderHeight: canvasRef.current?.height ?? window.innerHeight,
           }, { pos: cameraRef.current.pos, target: cameraRef.current.target }, sceneRef.current);
 
           const enc = device.createCommandEncoder();
@@ -2836,6 +2493,33 @@ const FluidSimulation: React.FC = () => {
               cp.dispatchWorkgroups(wc, wc, wc);
               cp.end();
 
+              const velocityTarget = stepIndex === 0 ? transport.velocityB : transport.velocityA;
+              (enc as any).copyBufferToBuffer(velocityTarget, 0, transport.velocityScratch, 0, transport.velocityBufferSize);
+
+              const divPass = enc.beginComputePass();
+              divPass.setPipeline(projectionDivPipeline);
+              divPass.setBindGroup(0, transport.projectionDivGroups[stepIndex]);
+              divPass.dispatchWorkgroups(wc, wc, wc);
+              divPass.end();
+
+              const jacobiIterations = qualityModeRef.current === 'accurate' ? 10 : 5;
+              let pressurePing = 0;
+              for (let iter = 0; iter < jacobiIterations; iter++) {
+                const jacobiPass = enc.beginComputePass();
+                jacobiPass.setPipeline(projectionJacobiPipeline);
+                jacobiPass.setBindGroup(0, transport.projectionJacobiGroups[pressurePing]);
+                jacobiPass.dispatchWorkgroups(wc, wc, wc);
+                jacobiPass.end();
+                pressurePing = 1 - pressurePing;
+              }
+
+              const pressureIndex = pressurePing === 0 ? 0 : 1;
+              const gradPass = enc.beginComputePass();
+              gradPass.setPipeline(projectionGradPipeline);
+              gradPass.setBindGroup(0, transport.projectionGradGroups[stepIndex][pressureIndex]);
+              gradPass.dispatchWorkgroups(wc, wc, wc);
+              gradPass.end();
+
               activeRenderGroup = stepIndex;
               simFrame += 1;
               substeps += 1;
@@ -2850,34 +2534,11 @@ const FluidSimulation: React.FC = () => {
               simAccumulatorSeconds = DEFAULT_TIME_STEP * 2;
             }
 
-            if (substeps > 0) {
-              const nextSootFloor = 1 - activeSootFloor;
-              const fp = enc.beginComputePass();
-              fp.setPipeline(sootFloorPipeline);
-              fp.setBindGroup(0, transport.floorGroups[activeRenderGroup][activeSootFloor]);
-              const twc = Math.ceil(transport.sootFloorSize / 8);
-              fp.dispatchWorkgroups(twc, twc, 1);
-              fp.end();
-              activeSootFloor = nextSootFloor;
-
-              const rpInject = enc.beginComputePass();
-              rpInject.setPipeline(radianceInjectPipeline);
-              rpInject.setBindGroup(0, transport.radianceInjectGroups[activeRenderGroup]);
-              const rwc = Math.ceil(transport.radianceDim / 4);
-              rpInject.dispatchWorkgroups(rwc, rwc, rwc);
-              rpInject.end();
-
-              const rpProp = enc.beginComputePass();
-              rpProp.setPipeline(radiancePropPipeline);
-              rpProp.setBindGroup(0, transport.radiancePropGroup);
-              rpProp.dispatchWorkgroups(rwc, rwc, rwc);
-              rpProp.end();
-            }
           }
 
-          const rp = enc.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: { r: 0.22, g: 0.22, b: 0.24, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
+          const rp = enc.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }, loadOp: 'clear', storeOp: 'store' }] });
           rp.setPipeline(renderPipeline);
-          rp.setBindGroup(0, transport.renderGroups[activeRenderGroup][activeSootFloor]);
+          rp.setBindGroup(0, transport.renderGroups[activeRenderGroup]);
           rp.draw(6);
           rp.end();
           device.queue.submit([enc.finish()]);
@@ -2890,7 +2551,6 @@ const FluidSimulation: React.FC = () => {
     return () => {
       isDestroyed = true;
       cancelAnimationFrame(animationFrameId);
-      disposeFloorMaterial?.();
       if (context) context.unconfigure();
       if (device) device.destroy();
     };
@@ -2904,10 +2564,26 @@ const FluidSimulation: React.FC = () => {
   };
 
   const captureFrame = () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const worldCanvas = worldCanvasRef.current;
+    const fireCanvas = canvasRef.current;
+    if (!worldCanvas && !fireCanvas) return;
+
+    const baseCanvas = worldCanvas ?? fireCanvas!;
+    const composite = document.createElement('canvas');
+    composite.width = baseCanvas.width;
+    composite.height = baseCanvas.height;
+    const ctx = composite.getContext('2d');
+    if (!ctx) return;
+
+    if (worldCanvas) {
+      ctx.drawImage(worldCanvas, 0, 0, composite.width, composite.height);
+    }
+    if (fireCanvas) {
+      ctx.drawImage(fireCanvas, 0, 0, composite.width, composite.height);
+    }
+
     const link = document.createElement('a');
-    link.href = canvas.toDataURL('image/png');
+    link.href = composite.toDataURL('image/png');
     link.download = `firesim-frame-${Date.now()}.png`;
     link.click();
   };
@@ -2915,8 +2591,8 @@ const FluidSimulation: React.FC = () => {
 const copyParamsToClipboard = useCallback(() => {
     const cpuUniformWriter = `// CPU-side SimParams uniform packing (DataView, little-endian)
 // NOTE: WGSL uses vec4f for cameraPos/targetPos to avoid vec3 padding traps.
-// Buffer size in this app: 256 bytes (fields used up through byte 252).
-const uniformData = new ArrayBuffer(256);
+// Buffer size in this app: 288 bytes (fields used up through byte 268).
+const uniformData = new ArrayBuffer(288);
 const view = new DataView(uniformData);
 const f32 = (byteOff: number, v: number) => view.setFloat32(byteOff, v, true);
 
@@ -2994,6 +2670,10 @@ f32(240, lightingFireIntensity);
 f32(244, lightingFireFalloff);
 f32(248, lightingFlicker);
 f32(252, lightingGlow);
+f32(256, viewportWidth);
+f32(260, viewportHeight);
+f32(264, cameraAspect);
+f32(268, cameraTanHalfFov);
 `;
 
     const payload = {
@@ -3003,15 +2683,16 @@ f32(252, lightingGlow);
       cpuUniformWriter,
       sceneId: selectedSceneId,
       gridSize,
+      runtimeResolutionScale,
       smokeEnabled: isSmokeEnabled,
       qualityMode,
       params: { ...simParams, timeStep: DEFAULT_TIME_STEP },
     };
     void copyText(JSON.stringify(payload, null, 2), 'Copied params JSON');
-  }, [copyText, gridSize, isSmokeEnabled, qualityMode, selectedSceneId, simParams]);
+  }, [copyText, gridSize, isSmokeEnabled, qualityMode, runtimeResolutionScale, selectedSceneId, simParams]);
 
   const copyAlgorithmToClipboard = useCallback(() => {
-    const payload = `// firesim algorithm (WGSL)\n// copiedAt: ${new Date().toISOString()}\n\n// === COMPUTE_SHADER ===\n${COMPUTE_SHADER}\n\n// === SOOT_FLOOR_UPDATE_SHADER ===\n${SOOT_FLOOR_UPDATE_SHADER}\n\n// === RADIANCE_CACHE_INJECT_SHADER ===\n${RADIANCE_CACHE_INJECT_SHADER}\n\n// === RADIANCE_CACHE_PROPAGATE_SHADER ===\n${RADIANCE_CACHE_PROPAGATE_SHADER}\n\n// === RENDER_SHADER ===\n${RENDER_SHADER}\n`;
+    const payload = `// firesim algorithm (WGSL)\n// copiedAt: ${new Date().toISOString()}\n\n// === COMPUTE_SHADER ===\n${COMPUTE_SHADER}\n\n// === PROJECTION_DIVERGENCE_SHADER ===\n${PROJECTION_DIVERGENCE_SHADER}\n\n// === PROJECTION_JACOBI_SHADER ===\n${PROJECTION_JACOBI_SHADER}\n\n// === PROJECTION_GRADIENT_SHADER ===\n${PROJECTION_GRADIENT_SHADER}\n\n// === RENDER_SHADER ===\n${RENDER_SHADER}\n`;
     void copyText(payload, 'Copied algorithm (WGSL)');
   }, [copyText]);
 
@@ -3021,6 +2702,7 @@ f32(252, lightingGlow);
       savedAt: new Date().toISOString(),
       sceneId: selectedSceneId,
       gridSize,
+      runtimeResolutionScale,
       smokeEnabled: isSmokeEnabled,
       qualityMode,
       params: { ...simParams, timeStep: DEFAULT_TIME_STEP },
@@ -3061,6 +2743,10 @@ f32(252, lightingGlow);
         const clampedGrid = [64, 128, 192, 256].includes(parsed.gridSize) ? parsed.gridSize : gridSize;
         setGridSize(clampedGrid);
       }
+      if (typeof parsed.runtimeResolutionScale === 'number') {
+        const nextScale = clamp(parsed.runtimeResolutionScale, 0.35, 1.0);
+        setRuntimeResolutionScale(nextScale);
+      }
       if (typeof parsed.smokeEnabled === 'boolean') {
         setIsSmokeEnabled(parsed.smokeEnabled);
       }
@@ -3083,6 +2769,7 @@ f32(252, lightingGlow);
       scene: activeScene.name,
       stats,
       gridSize,
+      runtimeResolutionScale,
       qualityMode,
       smokeEnabled: isSmokeEnabled,
       cflProxy,
@@ -3183,6 +2870,8 @@ f32(252, lightingGlow);
     const isTurb = deckRailSection === 'turbulence';
     const isFloor = deckRailSection === 'floor';
     const isLighting = deckRailSection === 'lighting';
+    const isResolution = deckRailSection === 'resolution';
+    const gridOptions = [64, 128, 192, 256] as const;
 
     return [
       (isAll || isConvection) && {
@@ -3222,6 +2911,51 @@ f32(252, lightingGlow);
         value: clamp(simParams.stepQuality * 0.8, 0, 1),
         valueText: `${clamp(simParams.stepQuality * 0.8, 0, 1).toFixed(2)}`,
         onChange: (t: number) => updateParam('stepQuality', clamp(t / 0.8, 0.25, 4)),
+      },
+      (isAll || isResolution) && {
+        id: 'renderResolution',
+        label: 'Render Resolution',
+        low: '35%',
+        high: '100%',
+        tone: 'cool' as const,
+        value: clamp(inverseLerp(0.35, 1.0, runtimeResolutionScale), 0, 1),
+        valueText: `${Math.round(runtimeResolutionScale * 100)}% (${internalCanvasSize.width}x${internalCanvasSize.height})`,
+        onChange: (t: number) => {
+          const next = clamp(lerp(0.35, 1.0, t), 0.35, 1.0);
+          setRuntimeResolutionScale(next);
+        },
+      },
+      (isAll || isResolution) && {
+        id: 'simGrid',
+        label: 'Simulation Grid',
+        low: '64',
+        high: '256',
+        tone: 'cool' as const,
+        value: clamp(inverseLerp(64, 256, gridSize), 0, 1),
+        valueText: `${gridSize}³`,
+        onChange: (t: number) => {
+          const target = lerp(64, 256, t);
+          let nextGrid: number = gridOptions[0];
+          let bestDist = Math.abs(target - nextGrid);
+          for (const opt of gridOptions) {
+            const dist = Math.abs(target - opt);
+            if (dist < bestDist) {
+              bestDist = dist;
+              nextGrid = opt;
+            }
+          }
+          setGridSize(nextGrid);
+        },
+      },
+      (isAll || isResolution) && {
+        id: 'qualityMode',
+        label: 'Quality Mode',
+        low: 'Realtime',
+        high: 'Accurate',
+        tone: 'mono' as const,
+        value: qualityMode === 'accurate' ? 1 : 0,
+        valueText: qualityMode === 'accurate' ? 'Accurate' : 'Realtime',
+        onChange: (t: number) => setQualityMode(t >= 0.5 ? 'accurate' : 'realtime'),
       },
       (isAll || isSmoke) && {
         id: 'smokeAmount',
@@ -3428,12 +3162,12 @@ f32(252, lightingGlow);
       },
       (isAll || isLighting) && {
         id: 'lightingFlicker',
-        label: 'Fire Flicker',
-        low: 'Stable',
-        high: 'Lively',
-        tone: 'warm' as const,
+        label: 'Sky Time',
+        low: 'Day',
+        high: 'Night',
+        tone: 'cool' as const,
         value: clamp(simParams.lightingFlicker, 0, 1),
-        valueText: `${simParams.lightingFlicker.toFixed(2)}`,
+        valueText: `${simParams.lightingFlicker.toFixed(2)} ${simParams.lightingFlicker < 0.5 ? 'Day' : 'Night'}`,
         onChange: (t: number) => updateParam('lightingFlicker', clamp(t, 0, 1)),
       },
       (isAll || isLighting) && {
@@ -3456,13 +3190,33 @@ f32(252, lightingGlow);
       valueText?: string;
       onChange: (t: number) => void;
     }>;
-  }, [applyMacro, deckRailSection, simParams, smokeAmount, smokeDarkness, turbulenceCharacter, tuningMacroKnobs, updateParam, windGusts, burnRate]);
+  }, [
+    applyMacro,
+    burnRate,
+    deckRailSection,
+    gridSize,
+    internalCanvasSize.height,
+    internalCanvasSize.width,
+    qualityMode,
+    runtimeResolutionScale,
+    simParams,
+    smokeAmount,
+    smokeDarkness,
+    turbulenceCharacter,
+    tuningMacroKnobs,
+    updateParam,
+    windGusts
+  ]);
 
   if (error) return <div className="deck-error" role="alert">{error}</div>;
 
   return (
     <div className="deck-root">
-      <canvas ref={canvasRef} width={internalCanvasSize.width} height={internalCanvasSize.height} className="deck-canvas"
+      <canvas
+        ref={worldCanvasRef}
+        width={Math.max(1, Math.round(dimensions.width * dimensions.pixelRatio))}
+        height={Math.max(1, Math.round(dimensions.height * dimensions.pixelRatio))}
+        className="deck-canvas deck-world-canvas"
         onPointerDown={e => { (e.target as HTMLElement).setPointerCapture(e.pointerId); interactionRef.current = { isDragging: true, lastX: e.clientX, lastY: e.clientY, button: e.button }; }}
         onPointerUp={e => { (e.target as HTMLElement).releasePointerCapture(e.pointerId); interactionRef.current.isDragging = false; }}
         onPointerMove={e => {
@@ -3474,6 +3228,12 @@ f32(252, lightingGlow);
           updateCameraVectors();
         }}
         onWheel={e => { cameraRef.current.radius = Math.max(0.1, Math.min(20, cameraRef.current.radius * (1 + e.deltaY * 0.001))); updateCameraVectors(); }}
+      />
+      <canvas
+        ref={canvasRef}
+        width={internalCanvasSize.width}
+        height={internalCanvasSize.height}
+        className="deck-canvas deck-fire-overlay"
       />
 
       <input
@@ -3560,6 +3320,7 @@ f32(252, lightingGlow);
           <button type="button" className={`deck-rail-btn ${deckRailSection === 'turbulence' ? 'is-active' : ''}`} aria-label="Turbulence" onClick={() => setDeckRailSection('turbulence')}><Shuffle size={18} /></button>
           <button type="button" className={`deck-rail-btn ${deckRailSection === 'floor' ? 'is-active' : ''}`} aria-label="Floor" onClick={() => setDeckRailSection('floor')}><Eye size={18} /></button>
           <button type="button" className={`deck-rail-btn ${deckRailSection === 'lighting' ? 'is-active' : ''}`} aria-label="Lighting" onClick={() => setDeckRailSection('lighting')}><Gauge size={18} /></button>
+          <button type="button" className={`deck-rail-btn ${deckRailSection === 'resolution' ? 'is-active' : ''}`} aria-label="Resolution" onClick={() => setDeckRailSection('resolution')}><Monitor size={18} /></button>
           <button type="button" className={`deck-rail-btn ${deckRailSection === 'library' ? 'is-active' : ''}`} aria-label="Presets" onClick={() => { setDeckRailSection('library'); fileInputRef.current?.click(); }}><Users size={18} /></button>
         </nav>
 
