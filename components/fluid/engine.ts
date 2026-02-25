@@ -853,9 +853,9 @@ fn getBlackbodyColor(temp: f32) -> vec3f {
 
 fn get_light_transmittance(pos: vec3f, lightDir: vec3f) -> f32 {
   var p = pos;
-  let step = 0.08;
+  let step = 0.11;
   var tau = 0.0;
-    for(var i=0; i<6; i++) {
+    for(var i=0; i<4; i++) {
         p += lightDir * step;
         if (!inside_volume_world(p)) { break; }
     let uv = to_volume_uv(p);
@@ -1124,10 +1124,10 @@ fn get_floor_material_fast(p: vec3f) -> vec3f {
            let sootOpt = 1.0 - exp(-sootRaw * 0.35);
            let hazeOpt = 1.0 - exp(-hazeRaw * 0.12);
            let activity = sootOpt + hazeOpt + reaction;
-           let emptyThreshold = 0.0012 / max(0.5, params.stepQuality);
+           let emptyThreshold = 0.0018 / max(0.5, params.stepQuality);
 
            if (activity < emptyThreshold) {
-             pos += rd * stepSize * 1.8;
+             pos += rd * stepSize * 2.4;
              continue;
            }
 
@@ -1153,8 +1153,8 @@ fn get_floor_material_fast(p: vec3f) -> vec3f {
 
              if (shadowRefreshCountdown <= 0) {
                cachedSunTrans = get_light_transmittance(pos, lightDir);
-               let denseMedium = reaction > 0.06 || sigmaT > 0.45;
-               shadowRefreshCountdown = select(2, 0, denseMedium);
+               let denseMedium = reaction > 0.08 || sigmaT > 0.55;
+               shadowRefreshCountdown = select(4, 0, denseMedium);
              } else {
                shadowRefreshCountdown -= 1;
              }
@@ -1191,11 +1191,11 @@ fn get_floor_material_fast(p: vec3f) -> vec3f {
 `;
 
 export const SCENES: ScenePreset[] = [
-  { id: 0, name: 'Campfire', params: { vorticity: 3.4, dissipation: 0.936, buoyancy: 1.5, drag: 0.0, emission: 8.4, scattering: 2.9, absorption: 26.5, smokeWeight: -2.0, plumeTurbulence: 10.0, smokeDissipation: 0.985, exposure: 0.9, gamma: 2.2, windX: 0.0, windZ: 0.0, turbFreq: 28.0, turbSpeed: 1.0, fuelEfficiency: 1.0, heatDiffusion: 0.0, stepQuality: 1.0, T_ignite: 0.18, T_burn: 0.55, burnRate: 6.0, fuelInject: 1.0, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
-  { id: 4, name: 'Wood Combustion', params: { vorticity: 2.2, dissipation: 0.903, buoyancy: 1.8, drag: 0.037, emission: 1.9, scattering: 6.5, absorption: 12.0, smokeWeight: 0.5, plumeTurbulence: 2.81, smokeDissipation: 0.985, windX: -0.05, windZ: 0.05, turbFreq: 15.0, turbSpeed: 2.5, fuelEfficiency: 1.5, heatDiffusion: 0.1, stepQuality: 1.0, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 9.0, fuelInject: 1.3, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
-  { id: 1, name: 'Candle', params: { vorticity: 3.5, dissipation: 0.92, buoyancy: 4.5, drag: 0.08, emission: 1.0, scattering: 2.5, absorption: 2.0, smokeWeight: 0.3, plumeTurbulence: 0.05, smokeDissipation: 0.985, windX: 0.0, windZ: 0.0, turbFreq: 45.0, turbSpeed: 0.2, fuelEfficiency: 0.5, heatDiffusion: 0.0, stepQuality: 1.5, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 3.0, fuelInject: 0.7, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
-  { id: 2, name: 'Dual Source', params: { vorticity: 15.0, dissipation: 0.985, buoyancy: 8.0, drag: 0.02, emission: 1.8, scattering: 4.5, absorption: 4.0, smokeWeight: 1.5, plumeTurbulence: 0.3, smokeDissipation: 0.992, windX: 0.2, windZ: 0.2, turbFreq: 20.0, turbSpeed: 1.5, fuelEfficiency: 1.0, heatDiffusion: 0.05, stepQuality: 1.0, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 6.0, fuelInject: 1.0, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
-  { id: 3, name: 'Firebending', params: { vorticity: 12.0, dissipation: 0.965, buoyancy: 5.0, drag: 0.002, emission: 3.0, scattering: 3.5, absorption: 1.5, smokeWeight: 0.5, plumeTurbulence: 0.8, smokeDissipation: 0.98, windX: 0.0, windZ: 0.0, turbFreq: 32.0, turbSpeed: 5.0, fuelEfficiency: 1.2, heatDiffusion: 0.0, stepQuality: 0.8, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 7.2, fuelInject: 1.12, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
-  { id: 5, name: 'Gas Explosion', params: { vorticity: 35.0, dissipation: 0.94, buoyancy: 16.0, drag: 0.01, emission: 6.0, scattering: 4.0, absorption: 1.0, smokeWeight: -0.5, plumeTurbulence: 1.5, smokeDissipation: 0.985, windX: 0.0, windZ: 0.0, turbFreq: 12.0, turbSpeed: 0.5, fuelEfficiency: 3.0, heatDiffusion: 0.2, stepQuality: 1.0, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 18.0, fuelInject: 2.2, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
-  { id: 6, name: 'Nuke', params: { vorticity: 50.0, dissipation: 0.998, buoyancy: 3.0, drag: 0.05, emission: 6.5, scattering: 8.0, absorption: 7.0, smokeWeight: 3.0, plumeTurbulence: 0.4, smokeDissipation: 0.999, windX: 0.0, windZ: 0.0, turbFreq: 8.0, turbSpeed: 0.1, fuelEfficiency: 5.0, heatDiffusion: 0.5, stepQuality: 1.2, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 30.0, fuelInject: 3.4, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } }
+  { id: 0, name: 'Campfire', params: { vorticity: 4.2, dissipation: 0.94, buoyancy: 1.8, drag: 0.01, emission: 7.6, scattering: 3.2, absorption: 20.0, smokeWeight: -1.2, plumeTurbulence: 4.8, smokeDissipation: 0.987, exposure: 0.9, gamma: 2.2, windX: 0.0, windZ: 0.0, turbFreq: 24.0, turbSpeed: 0.8, fuelEfficiency: 1.1, heatDiffusion: 0.02, stepQuality: 1.0, T_ignite: 0.18, T_burn: 0.55, burnRate: 6.5, fuelInject: 0.95, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
+  { id: 4, name: 'Wood Combustion', params: { vorticity: 3.0, dissipation: 0.928, buoyancy: 2.3, drag: 0.03, emission: 2.2, scattering: 5.6, absorption: 13.5, smokeWeight: 1.1, plumeTurbulence: 1.8, smokeDissipation: 0.989, windX: -0.03, windZ: 0.04, turbFreq: 14.0, turbSpeed: 1.3, fuelEfficiency: 1.35, heatDiffusion: 0.08, stepQuality: 1.0, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 7.5, fuelInject: 1.15, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
+  { id: 1, name: 'Candle', params: { vorticity: 2.6, dissipation: 0.952, buoyancy: 3.7, drag: 0.09, emission: 0.9, scattering: 1.8, absorption: 1.6, smokeWeight: 0.1, plumeTurbulence: 0.12, smokeDissipation: 0.992, windX: 0.0, windZ: 0.0, turbFreq: 38.0, turbSpeed: 0.15, fuelEfficiency: 0.55, heatDiffusion: 0.0, stepQuality: 1.35, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 2.4, fuelInject: 0.55, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
+  { id: 2, name: 'Dual Source', params: { vorticity: 9.0, dissipation: 0.972, buoyancy: 5.2, drag: 0.028, emission: 2.1, scattering: 4.2, absorption: 3.2, smokeWeight: 1.1, plumeTurbulence: 0.65, smokeDissipation: 0.992, windX: 0.08, windZ: 0.08, turbFreq: 18.0, turbSpeed: 1.1, fuelEfficiency: 1.0, heatDiffusion: 0.04, stepQuality: 0.95, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 5.6, fuelInject: 1.0, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
+  { id: 3, name: 'Firebending', params: { vorticity: 11.5, dissipation: 0.958, buoyancy: 4.6, drag: 0.012, emission: 3.1, scattering: 3.0, absorption: 1.3, smokeWeight: 0.35, plumeTurbulence: 1.2, smokeDissipation: 0.986, windX: 0.0, windZ: 0.0, turbFreq: 30.0, turbSpeed: 1.8, fuelEfficiency: 1.25, heatDiffusion: 0.01, stepQuality: 0.9, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 6.6, fuelInject: 1.08, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
+  { id: 5, name: 'Gas Explosion', params: { vorticity: 18.0, dissipation: 0.948, buoyancy: 10.0, drag: 0.022, emission: 5.0, scattering: 3.8, absorption: 1.2, smokeWeight: -0.2, plumeTurbulence: 1.1, smokeDissipation: 0.988, windX: 0.0, windZ: 0.0, turbFreq: 10.0, turbSpeed: 0.9, fuelEfficiency: 2.2, heatDiffusion: 0.12, stepQuality: 0.9, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 12.0, fuelInject: 1.9, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
+  { id: 6, name: 'Nuke', params: { vorticity: 22.0, dissipation: 0.986, buoyancy: 6.2, drag: 0.045, emission: 4.8, scattering: 6.5, absorption: 5.5, smokeWeight: 2.4, plumeTurbulence: 0.6, smokeDissipation: 0.995, windX: 0.02, windZ: -0.02, turbFreq: 9.0, turbSpeed: 0.6, fuelEfficiency: 2.8, heatDiffusion: 0.28, stepQuality: 1.0, exposure: 1.0, gamma: 2.2, T_ignite: 0.18, T_burn: 0.55, burnRate: 16.0, fuelInject: 2.4, heatYield: 3.4, sootYieldFlame: 0.55, sootYieldSmolder: 1.1, hazeConvertRate: 0.0, T_hazeStart: 0.35, T_hazeFull: 0.75, anisotropyG: 0.82, smokeThickness: 1.0, smokeDarkness: 0.25, flameSharpness: 4.0, volumeHeight: 1.0 } },
 ];
