@@ -74,13 +74,21 @@ class FluidTransport {
   public sootFloorTextures: GPUTexture[] = [];
   public sootFloorViews: GPUTextureView[] = [];
 
+  public radianceDim = 40;
+  public radianceA: GPUBuffer;
+  public radianceB: GPUBuffer;
+
   public physicsContract: ShaderContract;
   public renderContract: ShaderContract;
   public floorContract: ShaderContract;
+  public radianceInjectContract: ShaderContract;
+  public radiancePropContract: ShaderContract;
 
   public physicsGroups: GPUBindGroup[] = [];
   public renderGroups: GPUBindGroup[][] = [[], []];
   public floorGroups: GPUBindGroup[][] = [[], []];
+  public radianceInjectGroups: GPUBindGroup[] = [];
+  public radiancePropGroup: GPUBindGroup;
 
   constructor(private device: GPUDevice, public dim: number, private floorMaterial: FloorMaterialTextures) {
     const VOXEL_COUNT = dim * dim * dim;
@@ -101,8 +109,14 @@ class FluidTransport {
     this.velocityA = device.createBuffer({ size: VOXEL_COUNT * 16, usage: storageUsage });
     this.velocityB = device.createBuffer({ size: VOXEL_COUNT * 16, usage: storageUsage });
 
+    const radianceVoxelCount = this.radianceDim * this.radianceDim * this.radianceDim;
+    const radianceBufferSize = radianceVoxelCount * 16;
+    this.radianceA = device.createBuffer({ size: radianceBufferSize, usage: storageUsage });
+    this.radianceB = device.createBuffer({ size: radianceBufferSize, usage: storageUsage });
+
     const zeroF32 = new Float32Array(VOXEL_COUNT);
     const zeroVec4 = new Float32Array(VOXEL_COUNT * 4);
+    const zeroRadiance = new Float32Array(radianceVoxelCount * 4);
 
     device.queue.writeBuffer(this.densityA, 0, zeroF32);
     device.queue.writeBuffer(this.densityB, 0, zeroF32);
@@ -110,6 +124,8 @@ class FluidTransport {
     device.queue.writeBuffer(this.fuelB, 0, zeroF32);
     device.queue.writeBuffer(this.velocityA, 0, zeroVec4);
     device.queue.writeBuffer(this.velocityB, 0, zeroVec4);
+    device.queue.writeBuffer(this.radianceA, 0, zeroRadiance);
+    device.queue.writeBuffer(this.radianceB, 0, zeroRadiance);
 
     const textureUsage = (window as any).GPUTextureUsage;
     const floorTextureUsage = textureUsage.TEXTURE_BINDING | textureUsage.STORAGE_BINDING | textureUsage.COPY_DST;
@@ -159,6 +175,7 @@ class FluidTransport {
       { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
       { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
       { binding: 8, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+      { binding: 9, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     ]);
 
     this.floorContract = new ShaderContract(this.device, 'FloorSoot', [
@@ -167,6 +184,21 @@ class FluidTransport {
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
       { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r32float', viewDimension: '2d' } },
+    ]);
+
+    this.radianceInjectContract = new ShaderContract(this.device, 'RadianceInject', [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    ]);
+
+    this.radiancePropContract = new ShaderContract(this.device, 'RadianceProp', [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     ]);
   }
 
@@ -191,6 +223,7 @@ class FluidTransport {
       { binding: 6, resource: this.floorMaterial.roughnessView },
       { binding: 7, resource: this.floorMaterial.normalView },
       { binding: 8, resource: this.floorMaterial.sampler },
+      { binding: 9, resource: { buffer: this.radianceA } },
     ]);
 
     this.renderGroups[0][1] = this.renderContract.createBindGroup(this.device, 'Render0Soot1', [
@@ -203,6 +236,7 @@ class FluidTransport {
       { binding: 6, resource: this.floorMaterial.roughnessView },
       { binding: 7, resource: this.floorMaterial.normalView },
       { binding: 8, resource: this.floorMaterial.sampler },
+      { binding: 9, resource: { buffer: this.radianceA } },
     ]);
 
     this.floorGroups[0][0] = this.floorContract.createBindGroup(this.device, 'Floor0Soot0', [
@@ -241,6 +275,7 @@ class FluidTransport {
       { binding: 6, resource: this.floorMaterial.roughnessView },
       { binding: 7, resource: this.floorMaterial.normalView },
       { binding: 8, resource: this.floorMaterial.sampler },
+      { binding: 9, resource: { buffer: this.radianceA } },
     ]);
 
     this.renderGroups[1][1] = this.renderContract.createBindGroup(this.device, 'Render1Soot1', [
@@ -253,6 +288,7 @@ class FluidTransport {
       { binding: 6, resource: this.floorMaterial.roughnessView },
       { binding: 7, resource: this.floorMaterial.normalView },
       { binding: 8, resource: this.floorMaterial.sampler },
+      { binding: 9, resource: { buffer: this.radianceA } },
     ]);
 
     this.floorGroups[1][0] = this.floorContract.createBindGroup(this.device, 'Floor1Soot0', [
@@ -269,6 +305,30 @@ class FluidTransport {
       { binding: 2, resource: { buffer: this.velocityA } },
       { binding: 3, resource: this.sootFloorViews[1] },
       { binding: 4, resource: this.sootFloorViews[0] },
+    ]);
+
+    this.radianceInjectGroups[0] = this.radianceInjectContract.createBindGroup(this.device, 'RadianceInject0', [
+      { binding: 0, resource: { buffer: this.uniformBuffer } },
+      { binding: 1, resource: { buffer: this.densityB } },
+      { binding: 2, resource: { buffer: this.velocityB } },
+      { binding: 3, resource: { buffer: this.fuelB } },
+      { binding: 4, resource: { buffer: this.radianceA } },
+      { binding: 5, resource: { buffer: this.radianceB } },
+    ]);
+
+    this.radianceInjectGroups[1] = this.radianceInjectContract.createBindGroup(this.device, 'RadianceInject1', [
+      { binding: 0, resource: { buffer: this.uniformBuffer } },
+      { binding: 1, resource: { buffer: this.densityA } },
+      { binding: 2, resource: { buffer: this.velocityA } },
+      { binding: 3, resource: { buffer: this.fuelA } },
+      { binding: 4, resource: { buffer: this.radianceA } },
+      { binding: 5, resource: { buffer: this.radianceB } },
+    ]);
+
+    this.radiancePropGroup = this.radiancePropContract.createBindGroup(this.device, 'RadianceProp', [
+      { binding: 0, resource: { buffer: this.uniformBuffer } },
+      { binding: 1, resource: { buffer: this.radianceB } },
+      { binding: 2, resource: { buffer: this.radianceA } },
     ]);
   }
 
@@ -863,6 +923,136 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }
 `;
 
+const RADIANCE_CACHE_INJECT_SHADER = `
+${STRUCT_DEF}
+@group(0) @binding(0) var<uniform> params: SimParams;
+@group(0) @binding(1) var<storage, read> densityIn: array<f32>;
+@group(0) @binding(2) var<storage, read> velocityIn: array<vec4f>;
+@group(0) @binding(3) var<storage, read> fuelIn: array<f32>;
+@group(0) @binding(4) var<storage, read> radiancePrev: array<vec4f>;
+@group(0) @binding(5) var<storage, read_write> radianceOut: array<vec4f>;
+
+const RAD_DIM: i32 = 40;
+const RAD_DIM_U: u32 = 40u;
+
+fn sim_idx(p: vec3i) -> u32 {
+  let d = i32(params.dim);
+  let cp = clamp(p, vec3i(0), vec3i(d - 1));
+  return u32(cp.z * d * d + cp.y * d + cp.x);
+}
+
+fn sample_volume(uv: vec3f) -> vec3f {
+  let d = params.dim;
+  let p = uv * d - 0.5;
+  let i = vec3i(floor(p));
+  let f = fract(p);
+  let temp = mix(
+    mix(mix(densityIn[sim_idx(i)], densityIn[sim_idx(i + vec3i(1, 0, 0))], f.x), mix(densityIn[sim_idx(i + vec3i(0, 1, 0))], densityIn[sim_idx(i + vec3i(1, 1, 0))], f.x), f.y),
+    mix(mix(densityIn[sim_idx(i + vec3i(0, 0, 1))], densityIn[sim_idx(i + vec3i(1, 0, 1))], f.x), mix(densityIn[sim_idx(i + vec3i(0, 1, 1))], densityIn[sim_idx(i + vec3i(1, 1, 1))], f.x), f.y),
+    f.z
+  );
+  let soot = mix(
+    mix(mix(velocityIn[sim_idx(i)].w, velocityIn[sim_idx(i + vec3i(1, 0, 0))].w, f.x), mix(velocityIn[sim_idx(i + vec3i(0, 1, 0))].w, velocityIn[sim_idx(i + vec3i(1, 1, 0))].w, f.x), f.y),
+    mix(mix(velocityIn[sim_idx(i + vec3i(0, 0, 1))].w, velocityIn[sim_idx(i + vec3i(1, 0, 1))].w, f.x), mix(velocityIn[sim_idx(i + vec3i(0, 1, 1))].w, velocityIn[sim_idx(i + vec3i(1, 1, 1))].w, f.x), f.y),
+    f.z
+  );
+  let fuel = mix(
+    mix(mix(fuelIn[sim_idx(i)], fuelIn[sim_idx(i + vec3i(1, 0, 0))], f.x), mix(fuelIn[sim_idx(i + vec3i(0, 1, 0))], fuelIn[sim_idx(i + vec3i(1, 1, 0))], f.x), f.y),
+    mix(mix(fuelIn[sim_idx(i + vec3i(0, 0, 1))], fuelIn[sim_idx(i + vec3i(1, 0, 1))], f.x), mix(fuelIn[sim_idx(i + vec3i(0, 1, 1))], fuelIn[sim_idx(i + vec3i(1, 1, 1))], f.x), f.y),
+    f.z
+  );
+  return vec3f(temp, soot, fuel);
+}
+
+fn blackbody_fast(temp: f32) -> vec3f {
+  let t = max(0.0, temp - 0.12);
+  if (t < 0.3) { return mix(vec3f(0.0), vec3f(2.0, 0.06, 0.004), t / 0.3); }
+  if (t < 0.75) { return mix(vec3f(2.0, 0.06, 0.004), vec3f(5.0, 1.7, 0.2), (t - 0.3) / 0.45); }
+  if (t < 1.4) { return mix(vec3f(5.0, 1.7, 0.2), vec3f(10.0, 7.0, 1.6), (t - 0.75) / 0.65); }
+  return mix(vec3f(10.0, 7.0, 1.6), vec3f(22.0, 20.0, 16.0), clamp((t - 1.4) * 0.4, 0.0, 1.0));
+}
+
+fn rad_idx(p: vec3i) -> u32 {
+  let cp = clamp(p, vec3i(0), vec3i(RAD_DIM - 1));
+  return u32(cp.z * RAD_DIM * RAD_DIM + cp.y * RAD_DIM + cp.x);
+}
+
+fn rad_bounds_min() -> vec3f {
+  return vec3f(-0.7, 0.0, -0.7);
+}
+
+fn rad_bounds_max() -> vec3f {
+  return vec3f(1.7, max(1.25, params.volumeHeight * 1.95), 1.7);
+}
+
+fn inside_sim_world(p: vec3f) -> bool {
+  return p.x >= 0.0 && p.x <= 1.0 && p.z >= 0.0 && p.z <= 1.0 && p.y >= 0.0 && p.y <= params.volumeHeight;
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= RAD_DIM_U || gid.y >= RAD_DIM_U || gid.z >= RAD_DIM_U) { return; }
+
+  let cell = vec3i(gid.xyz);
+  let idx = rad_idx(cell);
+  let uv = (vec3f(gid.xyz) + 0.5) / f32(RAD_DIM);
+  let bmin = rad_bounds_min();
+  let bmax = rad_bounds_max();
+  let worldPos = mix(bmin, bmax, uv);
+
+  var emit = vec3f(0.0);
+  var absorb = 0.0;
+
+  if (inside_sim_world(worldPos)) {
+    let simUv = vec3f(worldPos.x, clamp(worldPos.y / max(1e-4, params.volumeHeight), 0.0, 1.0), worldPos.z);
+    let s = sample_volume(simUv);
+    let temp = max(0.0, s.x);
+    let soot = max(0.0, s.y);
+    let fuel = max(0.0, s.z);
+    let reaction = smoothstep(params.T_ignite, params.T_burn, temp) * (0.2 + 0.8 * smoothstep(0.0, 0.08, fuel));
+    emit = blackbody_fast(temp) * params.emission * reaction * 0.045;
+    absorb = soot * 0.04;
+  }
+
+  let prev = radiancePrev[idx].xyz;
+  let history = prev * max(0.0, 0.962 - absorb * 0.15);
+  let next = max(vec3f(0.0), history + emit * params.dt * 60.0);
+  radianceOut[idx] = vec4f(next, 1.0);
+}
+`;
+
+const RADIANCE_CACHE_PROPAGATE_SHADER = `
+${STRUCT_DEF}
+@group(0) @binding(0) var<uniform> params: SimParams;
+@group(0) @binding(1) var<storage, read> radianceIn: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> radianceOut: array<vec4f>;
+
+const RAD_DIM: i32 = 40;
+const RAD_DIM_U: u32 = 40u;
+
+fn rad_idx(p: vec3i) -> u32 {
+  let cp = clamp(p, vec3i(0), vec3i(RAD_DIM - 1));
+  return u32(cp.z * RAD_DIM * RAD_DIM + cp.y * RAD_DIM + cp.x);
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= RAD_DIM_U || gid.y >= RAD_DIM_U || gid.z >= RAD_DIM_U) { return; }
+
+  let c = vec3i(gid.xyz);
+  let center = radianceIn[rad_idx(c)].xyz;
+  var accum = center * 0.38;
+  accum += radianceIn[rad_idx(c + vec3i(1, 0, 0))].xyz * 0.103333;
+  accum += radianceIn[rad_idx(c + vec3i(-1, 0, 0))].xyz * 0.103333;
+  accum += radianceIn[rad_idx(c + vec3i(0, 1, 0))].xyz * 0.103333;
+  accum += radianceIn[rad_idx(c + vec3i(0, -1, 0))].xyz * 0.103333;
+  accum += radianceIn[rad_idx(c + vec3i(0, 0, 1))].xyz * 0.103333;
+  accum += radianceIn[rad_idx(c + vec3i(0, 0, -1))].xyz * 0.103333;
+  let next = max(vec3f(0.0), accum * 0.988);
+  radianceOut[rad_idx(c)] = vec4f(next, 1.0);
+}
+`;
+
 const RENDER_SHADER = `
 ${STRUCT_DEF}
 ${WOOD_SDF_FN}
@@ -875,6 +1065,7 @@ ${WOOD_SDF_FN}
 @group(0) @binding(6) var floorRoughnessTex: texture_2d<f32>;
 @group(0) @binding(7) var floorNormalTex: texture_2d<f32>;
 @group(0) @binding(8) var floorSampler: sampler;
+@group(0) @binding(9) var<storage, read> radianceCache: array<vec4f>;
 
 struct VertexOutput { @builtin(position) Position : vec4f, @location(0) uv : vec2f };
 
@@ -899,12 +1090,28 @@ fn to_volume_uv(p: vec3f) -> vec3f {
   return vec3f(p.x, clamp(p.y / h, 0.0, 1.0), p.z);
 }
 
+fn volume_edge_falloff_uv(uv: vec3f) -> f32 {
+  let ex = min(uv.x, 1.0 - uv.x);
+  let ey = min(uv.y, 1.0 - uv.y);
+  let ez = min(uv.z, 1.0 - uv.z);
+  let edge = min(min(ex, ey), ez);
+  return smoothstep(0.0, 0.065, edge);
+}
+
 fn sample_volume(pos: vec3f) -> vec3f {
   let d = params.dim; let p = pos * d - 0.5; let i = vec3i(floor(p)); let f = fract(p);
   let f_res = mix(mix(mix(densityIn[get_idx(i)], densityIn[get_idx(i + vec3i(1,0,0))], f.x), mix(densityIn[get_idx(i + vec3i(0,1,0))], densityIn[get_idx(i + vec3i(1,1,0))], f.x), f.y), mix(mix(densityIn[get_idx(i + vec3i(0,0,1))], densityIn[get_idx(i + vec3i(1,0,1))], f.x), mix(densityIn[get_idx(i + vec3i(0,1,1))], densityIn[get_idx(i + vec3i(1,1,1))], f.x), f.y), f.z);
   let s_res = mix(mix(mix(velocityIn[get_idx(i)].w, velocityIn[get_idx(i + vec3i(1,0,0))].w, f.x), mix(velocityIn[get_idx(i + vec3i(0,1,0))].w, velocityIn[get_idx(i + vec3i(1,1,0))].w, f.x), f.y), mix(mix(velocityIn[get_idx(i + vec3i(0,0,1))].w, velocityIn[get_idx(i + vec3i(1,0,1))].w, f.x), mix(velocityIn[get_idx(i + vec3i(0,1,1))].w, velocityIn[get_idx(i + vec3i(1,1,1))].w, f.x), f.y), f.z);
   let fu_res = mix(mix(mix(fuelIn[get_idx(i)], fuelIn[get_idx(i + vec3i(1,0,0))], f.x), mix(fuelIn[get_idx(i + vec3i(0,1,0))], fuelIn[get_idx(i + vec3i(1,1,0))], f.x), f.y), mix(mix(fuelIn[get_idx(i + vec3i(0,0,1))], fuelIn[get_idx(i + vec3i(1,0,1))], f.x), mix(fuelIn[get_idx(i + vec3i(0,1,1))], fuelIn[get_idx(i + vec3i(1,1,1))], f.x), f.y), f.z);
   return vec3f(f_res, s_res, fu_res);
+}
+
+fn sample_medium_world(p: vec3f) -> vec4f {
+  if (!inside_volume_world(p)) { return vec4f(0.0); }
+  let uv = to_volume_uv(p);
+  let falloff = volume_edge_falloff_uv(uv);
+  let v = sample_volume(uv) * falloff;
+  return vec4f(v, falloff);
 }
 
 fn sample_velocity_nearest(pos: vec3f) -> vec3f {
@@ -914,6 +1121,48 @@ fn sample_velocity_nearest(pos: vec3f) -> vec3f {
   let p = pos * d - 0.5;
   let i = vec3i(floor(p));
   return velocityIn[get_idx(i)].xyz;
+}
+
+const RAD_DIM: i32 = 40;
+
+fn rad_idx(p: vec3i) -> u32 {
+  let cp = clamp(p, vec3i(0), vec3i(RAD_DIM - 1));
+  return u32(cp.z * RAD_DIM * RAD_DIM + cp.y * RAD_DIM + cp.x);
+}
+
+fn rad_bounds_min() -> vec3f {
+  return vec3f(-0.7, 0.0, -0.7);
+}
+
+fn rad_bounds_max() -> vec3f {
+  return vec3f(1.7, max(1.25, params.volumeHeight * 1.95), 1.7);
+}
+
+fn sample_radiance_cache(worldPos: vec3f) -> vec3f {
+  let bmin = rad_bounds_min();
+  let bmax = rad_bounds_max();
+  let ext = max(vec3f(1e-4), bmax - bmin);
+  let uv = (worldPos - bmin) / ext;
+  if (any(uv < vec3f(0.0)) || any(uv > vec3f(1.0))) { return vec3f(0.0); }
+
+  let p = uv * f32(RAD_DIM) - 0.5;
+  let i = vec3i(floor(p));
+  let f = fract(p);
+
+  let c000 = radianceCache[rad_idx(i)].xyz;
+  let c100 = radianceCache[rad_idx(i + vec3i(1, 0, 0))].xyz;
+  let c010 = radianceCache[rad_idx(i + vec3i(0, 1, 0))].xyz;
+  let c110 = radianceCache[rad_idx(i + vec3i(1, 1, 0))].xyz;
+  let c001 = radianceCache[rad_idx(i + vec3i(0, 0, 1))].xyz;
+  let c101 = radianceCache[rad_idx(i + vec3i(1, 0, 1))].xyz;
+  let c011 = radianceCache[rad_idx(i + vec3i(0, 1, 1))].xyz;
+  let c111 = radianceCache[rad_idx(i + vec3i(1, 1, 1))].xyz;
+
+  return mix(
+    mix(mix(c000, c100, f.x), mix(c010, c110, f.x), f.y),
+    mix(mix(c001, c101, f.x), mix(c011, c111, f.x), f.y),
+    f.z
+  );
 }
 
 fn sample_soot_floor(uv: vec2f) -> f32 {
@@ -1150,36 +1399,36 @@ fn get_light_transmittance(pos: vec3f, lightDir: vec3f) -> f32 {
   var p = pos;
   let step = 0.11;
   var tau = 0.0;
-    for(var i=0; i<4; i++) {
-        p += lightDir * step;
-        if (!inside_volume_world(p)) { break; }
-  let uv = to_volume_uv(p);
-  let val = sample_volume(uv);
-  let soot = val.y;
-  let temp = val.x;
-  // Smoke taxonomy (minimum viable realism):
-  // - soot: dark, absorption-dominant, reduced near hottest flame but not removed
-  // - haze: scattering-dominant, appears as soot cools (mid/far plume)
-  let hot = smoothstep(0.35, 0.7, temp);
-  let cool = smoothstep(params.T_hazeStart, params.T_hazeFull, 1.0 - temp);
-  let height = smoothstep(0.22, 0.92, uv.y);
+  for(var i=0; i<4; i++) {
+    p += lightDir * step;
+    let m = sample_medium_world(p);
+    let soot = m.y;
+    let temp = m.x;
+    if ((soot + temp) < 1e-5) { continue; }
+    let uv = to_volume_uv(p);
+    // Smoke taxonomy (minimum viable realism):
+    // - soot: dark, absorption-dominant, reduced near hottest flame but not removed
+    // - haze: scattering-dominant, appears as soot cools (mid/far plume)
+    let hot = smoothstep(0.35, 0.7, temp);
+    let cool = smoothstep(params.T_hazeStart, params.T_hazeFull, 1.0 - temp);
+    let height = smoothstep(0.22, 0.92, uv.y);
 
-  let sootVis = mix(1.0, 0.25, hot);
-  let sootRaw = soot * sootVis;
-  let hazeRaw = soot * cool * height;
+    let sootVis = mix(1.0, 0.25, hot);
+    let sootRaw = soot * sootVis;
+    let hazeRaw = soot * cool * height;
 
-  let sootOpt = 1.0 - exp(-sootRaw * 0.35);
-  let hazeOpt = 1.0 - exp(-hazeRaw * 0.12);
+    let sootOpt = 1.0 - exp(-sootRaw * 0.35);
+    let hazeOpt = 1.0 - exp(-hazeRaw * 0.12);
 
-  let thickness = max(0.25, params.smokeThickness);
-  let darkness = clamp(params.smokeDarkness, 0.0, 1.0);
-  let absorption = params.absorption * thickness * (0.65 + 0.7 * darkness);
-  let scattering = params.scattering * thickness * (0.85 - 0.55 * darkness);
+    let thickness = max(0.25, params.smokeThickness);
+    let darkness = clamp(params.smokeDarkness, 0.0, 1.0);
+    let absorption = params.absorption * thickness * (0.65 + 0.7 * darkness);
+    let scattering = params.scattering * thickness * (0.85 - 0.55 * darkness);
 
-  let sigmaA = sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12;
-  let sigmaS = sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55;
-  tau += (sigmaA + sigmaS) * step;
-    }
+    let sigmaA = sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12;
+    let sigmaS = sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55;
+    tau += (sigmaA + sigmaS) * step;
+  }
   return exp(-tau);
 }
 
@@ -1196,55 +1445,51 @@ fn get_volume_lighting(pos: vec3f) -> vec3f {
     );
 
     for (var s = 0; s < 3; s++) {
-        let dir = normalize(dirs[s]);
+      let dir = normalize(dirs[s]);
 
-        // March upward from floor, find any fire along this direction
-        var t = 0.05;
-        var transmittance = 1.0;
+      // March upward from floor, find any fire along this direction
+      var t = 0.05;
+      var transmittance = 1.0;
 
-        for (var i = 0; i < 6; i++) {
-            let p = pos + dir * t;
+      for (var i = 0; i < 8; i++) {
+        if (transmittance < 0.02) { break; }
+        let p = pos + dir * t;
+        let uv = to_volume_uv(p);
+        let m = sample_medium_world(p);
+        let fuel = m.z;
+        let temp = m.x;
+        let soot = m.y;
 
-            // Stop if outside volume
-          if (!inside_volume_world(p)) { break; }
-            if (transmittance < 0.02) { break; }
+        var reaction = smoothstep(params.T_ignite, params.T_burn, temp);
+        let fuelGate = 0.25 + 0.75 * smoothstep(0.0, 0.10, fuel);
+        reaction *= fuelGate;
 
-          let uv = to_volume_uv(p);
-          let val = sample_volume(uv);
-
-            let fuel = val.z;
-            var reaction = smoothstep(params.T_ignite, params.T_burn, val.x);
-            let fuelGate = 0.25 + 0.75 * smoothstep(0.0, 0.10, fuel);
-            reaction *= fuelGate;
-
-            // Fire emits light downward to floor
-            if (reaction > 0.01) {
-              let emission = getBlackbodyColor(val.x) * (params.emission * 0.12) * reaction;
-                let atten = 1.0 / (1.0 + t * t * 5.0);
-              totalLight += emission * atten * transmittance * 0.2;
-            }
-
-            // Smoke blocks light
-            let soot = val.y;
-            let temp = val.x;
-            let hot = smoothstep(0.35, 0.7, temp);
-            let cool = smoothstep(params.T_hazeStart, params.T_hazeFull, 1.0 - temp);
-            let height = smoothstep(0.22, 0.92, uv.y);
-            let sootVis = mix(1.0, 0.25, hot);
-            let sootRaw = soot * sootVis;
-            let hazeRaw = soot * cool * height;
-            let sootOpt = 1.0 - exp(-sootRaw * 0.35);
-            let hazeOpt = 1.0 - exp(-hazeRaw * 0.12);
-            let thickness = max(0.25, params.smokeThickness);
-            let darkness = clamp(params.smokeDarkness, 0.0, 1.0);
-            let absorption = params.absorption * thickness * (0.65 + 0.7 * darkness);
-            let scattering = params.scattering * thickness * (0.85 - 0.55 * darkness);
-            let sigmaA = sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12;
-            let sigmaS = sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55;
-            transmittance *= exp(-(sigmaA + sigmaS) * 0.1 * 0.3);
-
-            t += 0.1;
+        // Fire emits light downward to floor
+        if (reaction > 0.01) {
+          let emission = getBlackbodyColor(temp) * (params.emission * 0.12) * reaction;
+          let atten = 1.0 / (1.0 + t * t * 5.0);
+          totalLight += emission * atten * transmittance * 0.2;
         }
+
+        // Smoke blocks light
+        let hot = smoothstep(0.35, 0.7, temp);
+        let cool = smoothstep(params.T_hazeStart, params.T_hazeFull, 1.0 - temp);
+        let height = smoothstep(0.22, 0.92, uv.y);
+        let sootVis = mix(1.0, 0.25, hot);
+        let sootRaw = soot * sootVis;
+        let hazeRaw = soot * cool * height;
+        let sootOpt = 1.0 - exp(-sootRaw * 0.35);
+        let hazeOpt = 1.0 - exp(-hazeRaw * 0.12);
+        let thickness = max(0.25, params.smokeThickness);
+        let darkness = clamp(params.smokeDarkness, 0.0, 1.0);
+        let absorption = params.absorption * thickness * (0.65 + 0.7 * darkness);
+        let scattering = params.scattering * thickness * (0.85 - 0.55 * darkness);
+        let sigmaA = sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12;
+        let sigmaS = sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55;
+        transmittance *= exp(-(sigmaA + sigmaS) * 0.1 * 0.3);
+
+        t += 0.1;
+      }
     }
 
     return totalLight * 0.5;
@@ -1285,7 +1530,8 @@ fn get_floor_material(p: vec3f, ro: vec3f) -> vec3f {
     let h = normalize(v + l);
 
     let fireBounceGain = max(0.0, params.floorFireBounce);
-    let gi = get_volume_lighting(p) + fire_light_approx(p) * fireBounceGain;
+    let cacheLight = sample_radiance_cache(p);
+    let gi = get_volume_lighting(p) + fire_light_approx(p) * fireBounceGain + cacheLight * (0.35 + 0.65 * fireBounceGain);
     let giStrength = dot(gi, vec3f(0.2126, 0.7152, 0.0722));
     let baseRough = clamp(baseRoughTex * 0.88 + 0.08, 0.08, 0.97);
     let sootRoughness = clamp(params.floorSootRoughness, 0.0, 2.0);
@@ -1340,7 +1586,8 @@ fn get_floor_material_fast(p: vec3f, ro: vec3f) -> vec3f {
     let NdotL = max(dot(n, l), 0.0);
     let specular = pow(max(dot(n, h), 0.0), shininess) * NdotL * mix(0.03, 0.008, sootVis) * max(0.0, params.floorSpecular);
     let heatMask = clamp(sootVis * 0.85 + contact * 0.65, 0.0, 1.0);
-    let fireBounce = fire_light_approx(p) * (0.48 + 0.52 * heatMask) * max(0.0, params.floorFireBounce);
+    let cacheLight = sample_radiance_cache(p);
+    let fireBounce = (fire_light_approx(p) + cacheLight * 0.9) * (0.48 + 0.52 * heatMask) * max(0.0, params.floorFireBounce);
     let ambient = vec3f(0.023) * max(0.0, params.floorAmbient);
     let contactOcclusion = 1.0 - contact * 0.4 * clamp(params.floorContactShadow, 0.0, 1.5);
     return albedo * (ambient + fireBounce * contactOcclusion * (0.35 + 0.65 * NdotL)) + vec3f(specular);
@@ -1351,186 +1598,183 @@ fn get_floor_material_fast(p: vec3f, ro: vec3f) -> vec3f {
   let right = normalize(cross(vec3f(0.0, 1.0, 0.0), fwd)); let up = cross(fwd, right);
   let rd = normalize(fwd + right * (in.uv.x - 0.5) * 2.0 + up * (in.uv.y - 0.5) * 2.0);
   let jitter = fract(sin(dot(in.uv + fract(params.time * 0.05), vec2f(12.9898, 78.233))) * 43758.5453);
-  let t = intersectAABB(ro, rd, vec3f(0.0), vec3f(1.0, params.volumeHeight, 1.0));
 
   let lightDir = normalize(vec3f(0.3, 1.0, 0.4));
   var bgCol = vec3f(0.22, 0.22, 0.24); // Medium gray background
 
-  var floor_color = bgCol;
+  let maxTraceDist = 5.5;
   var t_floor = -1.0;
-  if (rd.y < 0.0) {
-      t_floor = -ro.y / rd.y;
-  }
-
-  // Early exit if ray misses volume - just show floor/background
-  if (t.x > t.y || t.y < 0.0) {
-    if (t_floor > 0.0) {
-        let pFloor = ro + rd * t_floor;
-        floor_color = get_floor_material_fast(pFloor, ro) + fire_glow_along_ray(ro, rd) * (0.35 * max(0.0, params.lightingGlow));
-    } else {
-        floor_color = bgCol + fire_glow_along_ray(ro, rd);
+  if (rd.y < -0.0001) {
+    let tf = -ro.y / rd.y;
+    if (tf > 0.0 && tf < maxTraceDist) {
+      t_floor = tf;
     }
-    let mapped = tonemap_aces(floor_color * params.exposure);
-    return vec4f(pow(mapped, vec3f(1.0 / params.gamma)), 1.0);
   }
 
-  let tNear = max(0.0, t.x); var tVolumeFar = t.y; var solidColor = vec3f(0.0); var hasSolid = false;
-
-  // LOGS / WOOD RENDERING - lit only by fire
+  // Surface hits are solved in world space, independent of the sim AABB.
+  var tWood = maxTraceDist + 1.0;
+  var woodColor = vec3f(0.0);
   if (params.sceneType == 0.0 || params.sceneType == 4.0) {
-     var tS = tNear;
-     for(var i=0; i<90; i++) {
-        let p = ro + rd * tS; let d = get_wood_sdf(p);
-        if (d < 0.0004) {
-            hasSolid = true; tVolumeFar = min(t.y, tS);
-            let n = get_wood_normal(p);
-            let woodCol = mix(vec3f(0.12, 0.07, 0.03), vec3f(0.25, 0.15, 0.08), sin(length(p.xz-0.5)*120.0 + p.y*35.0)*0.5+0.5);
-
-            // Fire is the only light source for wood
-            let gi = get_volume_lighting(p) + fire_light_approx(p) * 0.75;
-            let ambient = vec3f(0.01);
-            solidColor = woodCol * gi * 3.0 + woodCol * ambient;
-            break;
-        }
-        tS += d * 0.92; if (tS > t.y) { break; }
-     }
+    var tS = 0.02;
+    for(var i=0; i<96; i++) {
+      if (tS > maxTraceDist) { break; }
+      let p = ro + rd * tS;
+      let d = get_wood_sdf(p);
+      if (d < 0.0004) {
+        tWood = tS;
+        let woodCol = mix(vec3f(0.12, 0.07, 0.03), vec3f(0.25, 0.15, 0.08), sin(length(p.xz-0.5)*120.0 + p.y*35.0)*0.5+0.5);
+        let gi = get_volume_lighting(p) + fire_light_approx(p) * 0.75 + sample_radiance_cache(p) * 0.9;
+        let ambient = vec3f(0.01);
+        woodColor = woodCol * gi * 3.0 + woodCol * ambient;
+        break;
+      }
+      tS += max(d * 0.92, 0.003);
+    }
   }
 
-  // WALL RENDERING - lit by fire (independent of volume bounds)
-  if (!hasSolid) {
-     var tW = 0.01;
-     for(var i=0; i<80; i++) {
-        let p = ro + rd * tW;
-        let d = get_wall_sdf(p);
-        if (d < 0.001) {
-            hasSolid = true;
-            if (tW < tVolumeFar) { tVolumeFar = tW; }
-            let n = get_wall_normal(p);
-
-            // Rough plaster/concrete wall color
-            let wallCol = vec3f(0.75, 0.72, 0.68);
-
-            // Fire illumination on wall
-            let gi = get_volume_lighting(p) + fire_light_approx(p) * 0.7;
-            let ambient = vec3f(0.015);
-
-            // Simple lambertian - wall faces toward fire get more light
-            let toFire = normalize(vec3f(0.5, 0.3, 0.5) - p);
-            let facing = max(0.0, dot(n, toFire));
-
-            solidColor = wallCol * gi * 2.5 * (0.3 + facing * 0.7) + wallCol * ambient;
-            break;
-        }
-        tW += max(d * 0.9, 0.005);
-        if (tW > 5.0) { break; }
-     }
+  var tWall = maxTraceDist + 1.0;
+  var wallColor = vec3f(0.0);
+  var tW = 0.02;
+  for(var i=0; i<96; i++) {
+    if (tW > maxTraceDist) { break; }
+    let p = ro + rd * tW;
+    let d = get_wall_sdf(p);
+    if (d < 0.001) {
+      tWall = tW;
+      let n = get_wall_normal(p);
+      let wallCol = vec3f(0.75, 0.72, 0.68);
+      let gi = get_volume_lighting(p) + fire_light_approx(p) * 0.7 + sample_radiance_cache(p) * 0.85;
+      let ambient = vec3f(0.015);
+      let toFire = normalize(vec3f(0.5, 0.3, 0.5) - p);
+      let facing = max(0.0, dot(n, toFire));
+      wallColor = wallCol * gi * 2.5 * (0.3 + facing * 0.7) + wallCol * ambient;
+      break;
+    }
+    tW += max(d * 0.9, 0.005);
   }
 
-  if (!hasSolid && t_floor > 0.0) {
-      floor_color = get_floor_material(ro + rd * t_floor, ro);
+  var tScene = maxTraceDist;
+  var surfaceCol = bgCol;
+  if (t_floor > 0.0 && t_floor < tScene) {
+    tScene = t_floor;
+    surfaceCol = get_floor_material(ro + rd * t_floor, ro);
+  }
+  if (tWall < tScene) {
+    tScene = tWall;
+    surfaceCol = wallColor;
+  }
+  if (tWood < tScene) {
+    tScene = tWood;
+    surfaceCol = woodColor;
   }
 
   let baseSteps = 160;
-  let steps = max(1, i32(round(f32(baseSteps) * params.stepQuality)));
-  let stepSize = max(1e-5, (tVolumeFar - tNear) / f32(steps)); var pos = ro + rd * (tNear + stepSize * jitter);
+  let rayFactor = clamp(tScene / 1.6, 0.65, 1.75);
+  let steps = clamp(i32(round(f32(baseSteps) * params.stepQuality * rayFactor)), 1, 420);
+  let stepSize = max(1e-4, tScene / f32(steps));
+  var pos = ro + rd * (stepSize * (0.5 + jitter));
   var accumCol = vec3f(0.0); var transmittance = 1.0; let phaseSun = phase_function(dot(rd, lightDir), params.anisotropyG);
   var cachedSunTrans = 1.0;
   var shadowRefreshCountdown = 0;
 
   for (var i = 0; i < steps; i++) {
-      if (transmittance < 0.005) { break; }
-     if (inside_volume_world(pos)) {
-         let uv = to_volume_uv(pos);
-       let val = sample_volume(uv);
-           let soot = val.y;
-           let temp = val.x;
-           let fuel = val.z;
-       let baseReaction = smoothstep(params.T_ignite, params.T_burn, temp);
-       var reaction = baseReaction;
-           if (baseReaction > 0.0005) {
-               if (((i & 1) == 0) || baseReaction > 0.72) {
-                   reaction = compute_reaction(uv, temp);
-               } else {
-                   let approxSharp = max(1.0, params.flameSharpness * 0.4);
-                   reaction = pow(baseReaction, approxSharp);
-               }
-           }
-           let fuelGate = 0.25 + 0.75 * smoothstep(0.0, 0.10, fuel);
-           reaction *= fuelGate;
-
-           // Smoke taxonomy (minimum viable realism):
-           // - soot: dark/absorbing, reduced near hottest flame but not removed
-           // - haze: scattering-dominant, appears as soot cools (mid/far plume)
-           let hot = smoothstep(0.35, 0.7, temp);
-           let cool = smoothstep(params.T_hazeStart, params.T_hazeFull, 1.0 - temp);
-           let height = smoothstep(0.22, 0.92, uv.y);
-           let sootVis = mix(1.0, 0.25, hot);
-           let sootRaw = soot * sootVis;
-           let hazeRaw = soot * cool * height;
-           let sootOpt = 1.0 - exp(-sootRaw * 0.35);
-           let hazeOpt = 1.0 - exp(-hazeRaw * 0.12);
-           let activity = sootOpt + hazeOpt + reaction;
-           let emptyThreshold = 0.0018 / max(0.5, params.stepQuality);
-
-             if (activity < emptyThreshold) {
-               pos += rd * stepSize * 2.4;
-               continue;
-             }
-
-             if ((sootOpt + hazeOpt) > 0.0001 || reaction > 0.0001) {
-               // Flow-locked micro detail (optimized): nearest velocity fetch + cheap hash noise.
-               let vel = sample_velocity_nearest(uv);
-               let velClamped = clamp(vel, vec3f(-60.0), vec3f(60.0));
-               let flowUv = uv - velClamped * 0.0006;
-               let detailFreq = 10.0 + params.turbFreq * 0.15;
-               let detail = clamp(cheap_noise(flowUv * detailFreq + vec3f(0.0, params.time * params.turbSpeed * 0.25, 0.0)), -1.0, 1.0);
-
-               // Absorption/scattering split: soot absorbs, haze scatters.
-               let thickness = max(0.25, params.smokeThickness);
-               let darkness = clamp(params.smokeDarkness, 0.0, 1.0);
-               let absorption = params.absorption * thickness * (0.65 + 0.7 * darkness);
-               let scattering = params.scattering * thickness * (0.85 - 0.55 * darkness);
-
-               let microSmoke = clamp(1.0 + detail * 0.06, 0.85, 1.15);
-               let sigmaA = (sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12) * microSmoke;
-               let sigmaS = (sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55) * microSmoke;
-               let sigmaT = sigmaA + sigmaS;
-               let stepTrans = exp(-sigmaT * stepSize);
-
-               if (shadowRefreshCountdown <= 0) {
-                 cachedSunTrans = get_light_transmittance(pos, lightDir);
-                 let denseMedium = reaction > 0.08 || sigmaT > 0.55;
-                 shadowRefreshCountdown = select(4, 0, denseMedium);
-               } else {
-                 shadowRefreshCountdown -= 1;
-               }
-
-               let sunTrans = cachedSunTrans;
-               let sootTint = vec3f(0.10, 0.09, 0.085);
-               let hazeTint = vec3f(0.18, 0.18, 0.19);
-               let sootFrac = clamp(sootOpt / max(1e-6, sootOpt + hazeOpt), 0.0, 1.0);
-               let smokeTint = mix(hazeTint, sootTint, sootFrac);
-               let scatterRadiance = vec3f(9.0) * sunTrans * phaseSun * smokeTint;
-               let scatterWeight = (sigmaS / max(1e-6, sigmaT)) * (1.0 - stepTrans);
-               accumCol += scatterRadiance * scatterWeight * transmittance;
-
-               // Flame-only emission: reaction emits, soot only attenuates.
-               // Apply a *soft* self-shadow (don't zero out emission inside smoke).
-               let shadowTr = max(0.35, mix(1.0, sunTrans, 0.35));
-               let microFlame = clamp(1.0 + detail * 0.18, 0.7, 1.3);
-               let reactionEm = reaction * reaction;
-               let emission = getBlackbodyColor(temp) * params.emission * reactionEm * shadowTr * microFlame;
-               accumCol += emission * transmittance * stepSize;
-
-               transmittance *= stepTrans;
-           }
+    if (transmittance < 0.005) { break; }
+    let uv = to_volume_uv(pos);
+    let m = sample_medium_world(pos);
+    let soot = m.y;
+    let temp = m.x;
+    let fuel = m.z;
+    let mediumMask = m.w;
+    if (mediumMask <= 0.00001) {
+      pos += rd * stepSize * 2.2;
+      continue;
+    }
+    {
+      let baseReaction = smoothstep(params.T_ignite, params.T_burn, temp);
+      var reaction = baseReaction;
+      if (baseReaction > 0.0005) {
+        if (((i & 1) == 0) || baseReaction > 0.72) {
+          reaction = compute_reaction(uv, temp);
+        } else {
+          let approxSharp = max(1.0, params.flameSharpness * 0.4);
+          reaction = pow(baseReaction, approxSharp);
+        }
       }
-      pos += rd * stepSize;
+      let fuelGate = 0.25 + 0.75 * smoothstep(0.0, 0.10, fuel);
+      reaction *= fuelGate;
+
+      // Smoke taxonomy (minimum viable realism):
+      // - soot: dark/absorbing, reduced near hottest flame but not removed
+      // - haze: scattering-dominant, appears as soot cools (mid/far plume)
+      let hot = smoothstep(0.35, 0.7, temp);
+      let cool = smoothstep(params.T_hazeStart, params.T_hazeFull, 1.0 - temp);
+      let height = smoothstep(0.22, 0.92, uv.y);
+      let sootVis = mix(1.0, 0.25, hot);
+      let sootRaw = soot * sootVis;
+      let hazeRaw = soot * cool * height;
+      let sootOpt = 1.0 - exp(-sootRaw * 0.35);
+      let hazeOpt = 1.0 - exp(-hazeRaw * 0.12);
+      let activity = sootOpt + hazeOpt + reaction;
+      let emptyThreshold = 0.0018 / max(0.5, params.stepQuality);
+
+      if (activity < emptyThreshold) {
+        pos += rd * stepSize * 2.2;
+        continue;
+      }
+
+      if ((sootOpt + hazeOpt) > 0.0001 || reaction > 0.0001) {
+        // Flow-locked micro detail (optimized): nearest velocity fetch + cheap hash noise.
+        let vel = sample_velocity_nearest(uv);
+        let velClamped = clamp(vel, vec3f(-60.0), vec3f(60.0));
+        let flowUv = uv - velClamped * 0.0006;
+        let detailFreq = 10.0 + params.turbFreq * 0.15;
+        let detail = clamp(cheap_noise(flowUv * detailFreq + vec3f(0.0, params.time * params.turbSpeed * 0.25, 0.0)), -1.0, 1.0);
+
+        // Absorption/scattering split: soot absorbs, haze scatters.
+        let thickness = max(0.25, params.smokeThickness);
+        let darkness = clamp(params.smokeDarkness, 0.0, 1.0);
+        let absorption = params.absorption * thickness * (0.65 + 0.7 * darkness);
+        let scattering = params.scattering * thickness * (0.85 - 0.55 * darkness);
+
+        let microSmoke = clamp(1.0 + detail * 0.06, 0.85, 1.15);
+        let sigmaA = (sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12) * microSmoke;
+        let sigmaS = (sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55) * microSmoke;
+        let sigmaT = sigmaA + sigmaS;
+        let stepTrans = exp(-sigmaT * stepSize);
+
+        if (shadowRefreshCountdown <= 0) {
+          cachedSunTrans = get_light_transmittance(pos, lightDir);
+          let denseMedium = reaction > 0.08 || sigmaT > 0.55;
+          shadowRefreshCountdown = select(4, 0, denseMedium);
+        } else {
+          shadowRefreshCountdown -= 1;
+        }
+
+        let sunTrans = cachedSunTrans;
+        let sootTint = vec3f(0.10, 0.09, 0.085);
+        let hazeTint = vec3f(0.18, 0.18, 0.19);
+        let sootFrac = clamp(sootOpt / max(1e-6, sootOpt + hazeOpt), 0.0, 1.0);
+        let smokeTint = mix(hazeTint, sootTint, sootFrac);
+        let scatterRadiance = vec3f(9.0) * sunTrans * phaseSun * smokeTint;
+        let scatterWeight = (sigmaS / max(1e-6, sigmaT)) * (1.0 - stepTrans);
+        accumCol += scatterRadiance * scatterWeight * transmittance;
+
+        // Flame-only emission: reaction emits, soot only attenuates.
+        // Apply a *soft* self-shadow (don't zero out emission inside smoke).
+        let shadowTr = max(0.35, mix(1.0, sunTrans, 0.35));
+        let microFlame = clamp(1.0 + detail * 0.18, 0.7, 1.3);
+        let reactionEm = reaction * reaction;
+        let emission = getBlackbodyColor(temp) * params.emission * reactionEm * shadowTr * microFlame;
+        accumCol += emission * transmittance * stepSize;
+
+        transmittance *= stepTrans;
+      }
+    }
+    pos += rd * stepSize;
   }
 
-  // Use same floor_color calculated at start
-  let surfaceCol = select(floor_color, solidColor, hasSolid);
-  let outsideGlow = fire_glow_along_ray(ro, rd) * transmittance;
+  let glowProbe = sample_radiance_cache(ro + rd * 0.9) * 0.25;
+  let outsideGlow = (fire_glow_along_ray(ro, rd) + glowProbe) * transmittance;
   let mapped = tonemap_aces((accumCol + transmittance * surfaceCol + outsideGlow) * params.exposure);
   return vec4f(pow(mapped, vec3f(1.0 / params.gamma)), 1.0);
 }
@@ -2506,6 +2750,8 @@ const FluidSimulation: React.FC = () => {
         const transport = new FluidTransport(device, gridSize, loadedFloorMaterial.material);
         const computePipeline = device.createComputePipeline({ layout: transport.physicsContract.layout, compute: { module: device.createShaderModule({ code: COMPUTE_SHADER }), entryPoint: 'main' } });
         const sootFloorPipeline = device.createComputePipeline({ layout: transport.floorContract.layout, compute: { module: device.createShaderModule({ code: SOOT_FLOOR_UPDATE_SHADER }), entryPoint: 'main' } });
+        const radianceInjectPipeline = device.createComputePipeline({ layout: transport.radianceInjectContract.layout, compute: { module: device.createShaderModule({ code: RADIANCE_CACHE_INJECT_SHADER }), entryPoint: 'main' } });
+        const radiancePropPipeline = device.createComputePipeline({ layout: transport.radiancePropContract.layout, compute: { module: device.createShaderModule({ code: RADIANCE_CACHE_PROPAGATE_SHADER }), entryPoint: 'main' } });
         const renderPipeline = device.createRenderPipeline({ layout: transport.renderContract.layout, vertex: { module: device.createShaderModule({ code: RENDER_SHADER }), entryPoint: 'vert_main' }, fragment: { module: device.createShaderModule({ code: RENDER_SHADER }), entryPoint: 'frag_main', targets: [{ format }] }, primitive: { topology: 'triangle-list' } });
 
         let simFrame = 0;
@@ -2613,6 +2859,19 @@ const FluidSimulation: React.FC = () => {
               fp.dispatchWorkgroups(twc, twc, 1);
               fp.end();
               activeSootFloor = nextSootFloor;
+
+              const rpInject = enc.beginComputePass();
+              rpInject.setPipeline(radianceInjectPipeline);
+              rpInject.setBindGroup(0, transport.radianceInjectGroups[activeRenderGroup]);
+              const rwc = Math.ceil(transport.radianceDim / 4);
+              rpInject.dispatchWorkgroups(rwc, rwc, rwc);
+              rpInject.end();
+
+              const rpProp = enc.beginComputePass();
+              rpProp.setPipeline(radiancePropPipeline);
+              rpProp.setBindGroup(0, transport.radiancePropGroup);
+              rpProp.dispatchWorkgroups(rwc, rwc, rwc);
+              rpProp.end();
             }
           }
 
@@ -2752,7 +3011,7 @@ f32(252, lightingGlow);
   }, [copyText, gridSize, isSmokeEnabled, qualityMode, selectedSceneId, simParams]);
 
   const copyAlgorithmToClipboard = useCallback(() => {
-    const payload = `// firesim algorithm (WGSL)\n// copiedAt: ${new Date().toISOString()}\n\n// === COMPUTE_SHADER ===\n${COMPUTE_SHADER}\n\n// === SOOT_FLOOR_UPDATE_SHADER ===\n${SOOT_FLOOR_UPDATE_SHADER}\n\n// === RENDER_SHADER ===\n${RENDER_SHADER}\n`;
+    const payload = `// firesim algorithm (WGSL)\n// copiedAt: ${new Date().toISOString()}\n\n// === COMPUTE_SHADER ===\n${COMPUTE_SHADER}\n\n// === SOOT_FLOOR_UPDATE_SHADER ===\n${SOOT_FLOOR_UPDATE_SHADER}\n\n// === RADIANCE_CACHE_INJECT_SHADER ===\n${RADIANCE_CACHE_INJECT_SHADER}\n\n// === RADIANCE_CACHE_PROPAGATE_SHADER ===\n${RADIANCE_CACHE_PROPAGATE_SHADER}\n\n// === RENDER_SHADER ===\n${RENDER_SHADER}\n`;
     void copyText(payload, 'Copied algorithm (WGSL)');
   }, [copyText]);
 
