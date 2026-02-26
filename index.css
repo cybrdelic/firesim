@@ -2002,6 +2002,36 @@ body {
   color: rgba(205, 214, 226, 0.80);
 }
 
+.deck-select-card {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: var(--deck-r-md);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background:
+    radial-gradient(160% 120% at 50% 140%, rgba(255, 140, 70, 0.08), transparent 62%),
+    linear-gradient(180deg, rgba(38, 40, 46, 0.58), rgba(18, 20, 24, 0.58));
+}
+
+.deck-select-card > span {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: rgba(205, 214, 226, 0.80);
+}
+
+.deck-select-card select {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(12, 14, 18, 0.78);
+  color: rgba(245, 248, 255, 0.92);
+  padding: 6px 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
 .deck-logs {
   margin-top: 4px;
 }
