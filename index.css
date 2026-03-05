@@ -2131,6 +2131,17 @@ body {
   box-shadow: 0 0 18px rgba(255, 255, 255, 0.10);
 }
 
+.deck-meter-fill.is-gpu {
+  background: linear-gradient(90deg, rgba(100, 200, 255, 0.85), rgba(180, 230, 255, 0.70));
+  box-shadow: 0 0 18px rgba(100, 200, 255, 0.14);
+}
+
+.deck-meter-divider {
+  height: 1px;
+  margin: 4px 0;
+  background: rgba(255, 255, 255, 0.08);
+}
+
 /* Status bar */
 .deck-statusbar {
   position: absolute;

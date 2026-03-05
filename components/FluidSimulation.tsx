@@ -83,6 +83,9 @@ class ShaderContract {
 class FluidTransport {
   public uniformBuffer: GPUBuffer;
 
+  private uniformStaging: ArrayBuffer;
+  private uniformView: DataView;
+
   public densityA: GPUBuffer;
   public densityB: GPUBuffer;
   public fuelA: GPUBuffer;
@@ -95,19 +98,24 @@ class FluidTransport {
   public divergence: GPUBuffer;
   public pressureA: GPUBuffer;
   public pressureB: GPUBuffer;
+  public occupancy: GPUBuffer;
+  public rayStepCounter: GPUBuffer;
   public velocityBufferSize: number;
+  public macrocellsPerAxis: number;
 
-  public physicsContract: ShaderContract;
-  public renderContract: ShaderContract;
-  public projectionDivContract: ShaderContract;
-  public projectionJacobiContract: ShaderContract;
-  public projectionGradContract: ShaderContract;
+  public physicsContract!: ShaderContract;
+  public renderContract!: ShaderContract;
+  public projectionDivContract!: ShaderContract;
+  public projectionJacobiContract!: ShaderContract;
+  public projectionGradContract!: ShaderContract;
+  public occupancyContract!: ShaderContract;
 
   public physicsGroups: GPUBindGroup[] = [];
   public renderGroups: GPUBindGroup[] = [];
   public projectionDivGroups: GPUBindGroup[] = [];
   public projectionJacobiGroups: GPUBindGroup[] = [];
   public projectionGradGroups: GPUBindGroup[][] = [[], []];
+  public occupancyGroups: GPUBindGroup[] = [];
 
   constructor(
     private device: GPUDevice,
@@ -119,6 +127,9 @@ class FluidTransport {
       size: 288,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
+
+    this.uniformStaging = new ArrayBuffer(288);
+    this.uniformView = new DataView(this.uniformStaging);
 
     const bufferUsage = (window as any).GPUBufferUsage;
     const storageUsage = bufferUsage.STORAGE | bufferUsage.COPY_DST | bufferUsage.COPY_SRC;
@@ -139,6 +150,16 @@ class FluidTransport {
     this.divergence = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
     this.pressureA = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
     this.pressureB = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
+
+    // Task C: Macrocell occupancy grid (8 voxels per macrocell per axis)
+    const MACROCELL_SIZE = 8;
+    this.macrocellsPerAxis = Math.ceil(dim / MACROCELL_SIZE);
+    const macrocellCount = this.macrocellsPerAxis ** 3;
+    this.occupancy = device.createBuffer({ size: macrocellCount * 4, usage: storageUsage });
+    device.queue.writeBuffer(this.occupancy, 0, new Uint32Array(macrocellCount));
+
+    // Task B: Ray step counter (single atomic u32)
+    this.rayStepCounter = device.createBuffer({ size: 4, usage: storageUsage });
 
     const zeroF32 = new Float32Array(VOXEL_COUNT);
     // Initialize velocity.w = oxygen = 1.0 (fully oxygenated atmosphere)
@@ -182,6 +203,17 @@ class FluidTransport {
       { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
       { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
       { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+      { binding: 5, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+      { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'storage' } },
+    ]);
+
+    // Task C: Occupancy compute contract
+    this.occupancyContract = new ShaderContract(this.device, 'Occupancy', [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     ]);
 
     this.projectionDivContract = new ShaderContract(this.device, 'ProjectionDiv', [
@@ -224,6 +256,8 @@ class FluidTransport {
       { binding: 2, resource: { buffer: this.velocityB } },
       { binding: 3, resource: { buffer: this.fuelB } },
       { binding: 4, resource: { buffer: this.sootB } },
+      { binding: 5, resource: { buffer: this.occupancy } },
+      { binding: 6, resource: { buffer: this.rayStepCounter } },
     ]);
 
     this.physicsGroups[1] = this.physicsContract.createBindGroup(this.device, 'Phys1', [
@@ -244,6 +278,24 @@ class FluidTransport {
       { binding: 2, resource: { buffer: this.velocityA } },
       { binding: 3, resource: { buffer: this.fuelA } },
       { binding: 4, resource: { buffer: this.sootA } },
+      { binding: 5, resource: { buffer: this.occupancy } },
+      { binding: 6, resource: { buffer: this.rayStepCounter } },
+    ]);
+
+    // Task C: Occupancy bind groups (match render group buffer selection)
+    this.occupancyGroups[0] = this.occupancyContract.createBindGroup(this.device, 'Occupancy0', [
+      { binding: 0, resource: { buffer: this.uniformBuffer } },
+      { binding: 1, resource: { buffer: this.densityB } },
+      { binding: 2, resource: { buffer: this.fuelB } },
+      { binding: 3, resource: { buffer: this.sootB } },
+      { binding: 4, resource: { buffer: this.occupancy } },
+    ]);
+    this.occupancyGroups[1] = this.occupancyContract.createBindGroup(this.device, 'Occupancy1', [
+      { binding: 0, resource: { buffer: this.uniformBuffer } },
+      { binding: 1, resource: { buffer: this.densityA } },
+      { binding: 2, resource: { buffer: this.fuelA } },
+      { binding: 3, resource: { buffer: this.sootA } },
+      { binding: 4, resource: { buffer: this.occupancy } },
     ]);
 
     this.projectionDivGroups[0] = this.projectionDivContract.createBindGroup(this.device, 'ProjectionDiv0', [
@@ -307,8 +359,7 @@ class FluidTransport {
     camera: { pos: number[], target: number[] },
     sceneType: number
   ) {
-    const uniformData = new ArrayBuffer(288);
-    const view = new DataView(uniformData);
+    const view = this.uniformView;
 
     view.setFloat32(0, this.dim, true);
     view.setFloat32(4, now / 1000.0, true);
@@ -411,7 +462,7 @@ class FluidTransport {
     view.setFloat32(280, params.rayStepBudget ?? 160.0, true);
     view.setFloat32(284, params.occlusionStepBudget ?? 80.0, true);
 
-    this.device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
+    this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformStaging);
   }
 }
 
@@ -701,6 +752,16 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   if (isSolid) {
     densityOut[idx] = 0.0;
     velocityOut[idx] = vec4f(0.0, 0.0, 0.0, 1.0); // oxygen=1 inside solids
+    fuelOut[idx] = 0.0;
+    sootOut[idx] = 0.0;
+    return;
+  }
+
+  // Wood boundary handling: keep a thin combustion band near the surface,
+  // but prevent scalar fields from accumulating deep inside the log core.
+  if (usesWood && woodDist < -0.025) {
+    densityOut[idx] = 0.0;
+    velocityOut[idx] = vec4f(0.0, 0.0, 0.0, 1.0);
     fuelOut[idx] = 0.0;
     sootOut[idx] = 0.0;
     return;
@@ -1092,6 +1153,132 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }
 `;
 
+// Task C: Macrocell occupancy compute shader
+// Builds a coarse 3D grid marking which macrocells contain any visible content.
+// Each thread handles one macrocell (8³ voxels), sampling every 2nd voxel (4³=64 reads).
+const OCCUPANCY_SHADER = `
+${STRUCT_DEF}
+@group(0) @binding(0) var<uniform> params: SimParams;
+@group(0) @binding(1) var<storage, read> densityIn: array<f32>;
+@group(0) @binding(2) var<storage, read> fuelIn: array<f32>;
+@group(0) @binding(3) var<storage, read> sootIn: array<f32>;
+@group(0) @binding(4) var<storage, read_write> occupancy: array<u32>;
+
+const MACROCELL_SIZE: u32 = 8u;
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let dim = u32(params.dim);
+  let macroPerAxis = dim / MACROCELL_SIZE;
+  if (gid.x >= macroPerAxis || gid.y >= macroPerAxis || gid.z >= macroPerAxis) { return; }
+
+  let base = gid * MACROCELL_SIZE;
+  var occupied = 0u;
+  // Sample every 2nd voxel in each axis (4³ = 64 reads per macrocell)
+  for (var z = 0u; z < MACROCELL_SIZE && occupied == 0u; z += 2u) {
+    for (var y = 0u; y < MACROCELL_SIZE && occupied == 0u; y += 2u) {
+      for (var x = 0u; x < MACROCELL_SIZE && occupied == 0u; x += 2u) {
+        let p = base + vec3u(x, y, z);
+        if (p.x < dim && p.y < dim && p.z < dim) {
+          let idx = p.z * dim * dim + p.y * dim + p.x;
+          let d = abs(densityIn[idx]);
+          let f = abs(fuelIn[idx]);
+          let s = abs(sootIn[idx]);
+          if (d + f + s > 0.002) {
+            occupied = 1u;
+          }
+        }
+      }
+    }
+  }
+  let macroIdx = gid.z * macroPerAxis * macroPerAxis + gid.y * macroPerAxis + gid.x;
+  occupancy[macroIdx] = occupied;
+}
+`;
+
+// Task E: Temporal accumulation — blend current frame with history + neighborhood clamping
+const TEMPORAL_BLEND_SHADER = `
+@group(0) @binding(0) var currentTex: texture_2d<f32>;
+@group(0) @binding(1) var historyTex: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+
+struct VertexOutput { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex fn vert_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
+  var positions = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0), vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0));
+  var out: VertexOutput;
+  out.pos = vec4f(positions[vi], 0.0, 1.0);
+  out.uv = positions[vi] * 0.5 + 0.5;
+  return out;
+}
+
+@fragment fn frag_main(in: VertexOutput) -> @location(0) vec4f {
+  let texSize = vec2f(textureDimensions(currentTex));
+  let texelSize = 1.0 / texSize;
+  let current = textureSample(currentTex, samp, in.uv);
+  let history = textureSample(historyTex, samp, in.uv);
+
+  // 3x3 neighborhood clamping: prevent ghosting by clamping history to current's local range
+  var minC = current;
+  var maxC = current;
+  for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+      if (dx == 0 && dy == 0) { continue; }
+      let neighbor = textureSample(currentTex, samp, in.uv + vec2f(f32(dx), f32(dy)) * texelSize);
+      minC = min(minC, neighbor);
+      maxC = max(maxC, neighbor);
+    }
+  }
+  // Expand clamp range slightly to allow subtle sub-pixel detail through
+  let margin = (maxC - minC) * 0.15;
+  let clampedHistory = clamp(history, minC - margin, maxC + margin);
+
+  // Exponential blend: 20% current, 80% clamped history (smooth accumulation)
+  let blendAlpha = 0.20;
+  return mix(clampedHistory, current, blendAlpha);
+}
+`;
+
+// Task D: Half-res volume render — bilateral upsample shader
+const UPSAMPLE_SHADER = `
+@group(0) @binding(0) var halfResTex: texture_2d<f32>;
+@group(0) @binding(1) var halfResSamp: sampler;
+
+struct VertexOutput { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex fn vert_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
+  var positions = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0), vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0));
+  var out: VertexOutput;
+  out.pos = vec4f(positions[vi], 0.0, 1.0);
+  out.uv = positions[vi] * 0.5 + 0.5;
+  return out;
+}
+
+@fragment fn frag_main(in: VertexOutput) -> @location(0) vec4f {
+  let texSize = vec2f(textureDimensions(halfResTex));
+  let texelSize = 1.0 / texSize;
+  // 4-tap bilateral: weight by color similarity to preserve flame edges
+  let center = textureSample(halfResTex, halfResSamp, in.uv);
+  let offsets = array<vec2f, 4>(
+    vec2f(-0.5, -0.5) * texelSize,
+    vec2f( 0.5, -0.5) * texelSize,
+    vec2f(-0.5,  0.5) * texelSize,
+    vec2f( 0.5,  0.5) * texelSize
+  );
+  var weightSum = 1.0;
+  var colorSum = center;
+  let sigma = 0.15;
+  for (var i = 0; i < 4; i++) {
+    let s = textureSample(halfResTex, halfResSamp, in.uv + offsets[i]);
+    let diff = length(s.rgb - center.rgb);
+    let w = exp(-diff * diff / (2.0 * sigma * sigma));
+    colorSum += s * w;
+    weightSum += w;
+  }
+  return colorSum / weightSum;
+}
+`;
+
 const RENDER_SHADER = `
 ${STRUCT_DEF}
 ${WOOD_SDF_FN}
@@ -1100,6 +1287,19 @@ ${WOOD_SDF_FN}
 @group(0) @binding(2) var<storage, read> velocityIn: array<vec4f>;
 @group(0) @binding(3) var<storage, read> fuelIn: array<f32>;
 @group(0) @binding(4) var<storage, read> sootIn: array<f32>;
+@group(0) @binding(5) var<storage, read> occupancy: array<u32>;
+@group(0) @binding(6) var<storage, read_write> rayStepCounter: atomic<u32>;
+
+// Task C: Macrocell empty-space skip
+const MACROCELL_SIZE: u32 = 8u;
+fn is_macrocell_occupied(uv: vec3f) -> bool {
+  let dim = u32(params.dim);
+  let macroPerAxis = dim / MACROCELL_SIZE;
+  let fMpa = f32(macroPerAxis);
+  let mc = vec3u(clamp(uv * fMpa, vec3f(0.0), vec3f(fMpa - 1.0)));
+  let idx = mc.z * macroPerAxis * macroPerAxis + mc.y * macroPerAxis + mc.x;
+  return occupancy[idx] != 0u;
+}
 
 struct VertexOutput { @builtin(position) Position : vec4f, @location(0) uv : vec2f };
 
@@ -1183,8 +1383,8 @@ fn compute_reaction(pos: vec3f, temp: f32) -> f32 {
   let fuelGate = smoothstep(0.0, 0.08, fuel);
   let oxygenGate = smoothstep(0.05, 0.3, oxygen);
 
-  // Temperature gradient sharpening for flame front localization
-  let eps = 1.0 / params.dim;
+  // Task G: Softened gradient gating - wider band, less harsh sheets
+  let eps = 1.5 / params.dim;
   let txp = sample_volume(pos + vec3f(eps, 0.0, 0.0)).x;
   let txn = sample_volume(pos - vec3f(eps, 0.0, 0.0)).x;
   let typ = sample_volume(pos + vec3f(0.0, eps, 0.0)).x;
@@ -1194,10 +1394,12 @@ fn compute_reaction(pos: vec3f, temp: f32) -> f32 {
   let grad = vec3f(txp - txn, typ - tyn, tzp - tzn);
   let gradMag = length(grad) * 0.5;
 
-  // Sharpen the reaction front so emission collapses into sheets/tongues.
-  let front = smoothstep(0.035, 0.055, gradMag);
-  let r = tempGate * front * fuelGate * oxygenGate;
-  let sharp = max(1.0, params.flameSharpness);
+  // Widened gradient gate: volumetric glow instead of torn-paper sheets
+  let front = smoothstep(0.015, 0.08, gradMag);
+  // Blend: 60% temp-gated volumetric + 40% gradient-sharpened front
+  let r = tempGate * (0.6 + 0.4 * front) * fuelGate * oxygenGate;
+  // Cap sharpness to prevent crunchy artifacts
+  let sharp = clamp(params.flameSharpness, 1.0, 3.0);
   return pow(clamp(r, 0.0, 1.0), sharp);
 }
 
@@ -1343,7 +1545,12 @@ fn intersect_occluders(ro: vec3f, rd: vec3f, minT: f32, maxT: f32, useSdfOcclude
   let tanHalfFov = max(0.05, params.cameraTanHalfFov);
   let ndc = (in.uv - 0.5) * 2.0;
   let rd = safe_norm(fwd + right * (ndc.x * aspect * tanHalfFov) + up * (ndc.y * tanHalfFov), fwd);
-  let jitter = fract(sin(dot(in.uv, vec2f(12.9898, 78.233))) * 43758.5453);
+  // Task F: Blue-noise jitter via R2 quasi-random sequence + frame cycling
+  // R2 sequence: alpha1 = 1/phi2, alpha2 = 1/phi2^2 where phi2 = 1.32471795724...
+  let frameIdx = u32(params.time * 60.0) % 64u;
+  let r2_alpha = vec2f(0.7548776662, 0.5698402910);
+  let r2_base = fract(in.uv * vec2f(params.viewportWidth, params.viewportHeight) * r2_alpha);
+  let jitter = fract(r2_base.x + f32(frameIdx) * 0.7548776662);
 
   let lightDir = normalize(vec3f(0.3, 1.0, 0.4));
   let boundsPad = 0.12;
@@ -1376,11 +1583,22 @@ fn intersect_occluders(ro: vec3f, rd: vec3f, minT: f32, maxT: f32, useSdfOcclude
   var shadowRefreshCountdown = 0;
   var maxReactionSeen = 0.0;
   var minWoodDist = 1e6;
+  var stepsTaken = 0u;
 
   for (var i = 0; i < steps; i++) {
+    stepsTaken += 1u;
     if (transmittance < 0.005 || t > maxTraceDist) { break; }
     let pos = ro + rd * t;
     let uv = to_volume_uv(pos);
+
+    // Task C: Macrocell empty-space skip - jump through empty macrocells
+    if (!is_macrocell_occupied(uv)) {
+      // Advance to next macrocell boundary (approx macrocell width in world space)
+      let macroStep = 1.0 / f32(u32(params.dim) / MACROCELL_SIZE);
+      t += max(baseStep, macroStep * 0.45);
+      continue;
+    }
+
     let m = sample_medium_world(pos);
     let temp = m.x;
     let soot = m.y;
@@ -1488,6 +1706,9 @@ fn intersect_occluders(ro: vec3f, rd: vec3f, minT: f32, maxT: f32, useSdfOcclude
       }
     }
   }
+
+  // Task B: Accumulate total ray steps for readout
+  atomicAdd(&rayStepCounter, stepsTaken);
 
   let mapped = tonemap_aces(accumCol * params.exposure);
   let outColor = pow(mapped, vec3f(1.0 / params.gamma));
@@ -2207,8 +2428,9 @@ const makeProceduralLogMaterials = (seed = 9127, size = 512): ProceduralLogMater
       const p = index * 4;
 
       const warp = fbm2(u * 4.3, v * 3.2, seed + 19, 3);
-      const ridges = 1.0 - Math.abs(Math.sin((u + (warp - 0.5) * 0.17) * Math.PI * 36.0));
-      const ridgeMask = Math.pow(clamp(ridges, 0.0, 1.0), 4.2);
+      // Less-regular bark ridges to avoid a “barcode” look at typical viewing distances.
+      const ridges = 1.0 - Math.abs(Math.sin((u + (warp - 0.5) * 0.22) * Math.PI * 18.0));
+      const ridgeMask = Math.pow(clamp(ridges, 0.0, 1.0), 2.8);
       const coarse = fbm2(u * 12.0 + 1.2, v * 2.1 - 0.8, seed + 41, 4);
       const fine = fbm2(u * 40.0, v * 8.0 + 0.5, seed + 77, 2);
       const knotField = fbm2(u * 7.0 - 2.7, v * 12.0 + 1.9, seed + 131, 4);
@@ -2216,7 +2438,7 @@ const makeProceduralLogMaterials = (seed = 9127, size = 512): ProceduralLogMater
       const charField = fbm2(u * 9.0 + 2.3, v * 11.0 - 1.1, seed + 211, 3);
       const char = clamp((charField - 0.81) * 3.0, 0.0, 1.0);
 
-      const height = clamp(0.50 * ridgeMask + 0.34 * coarse + 0.16 * fine + 0.2 * knot, 0.0, 1.0);
+      const height = clamp(0.34 * ridgeMask + 0.38 * coarse + 0.18 * fine + 0.2 * knot, 0.0, 1.0);
       heightData[index] = height;
       const cavity = Math.pow(1.0 - height, 1.6);
 
@@ -2241,7 +2463,7 @@ const makeProceduralLogMaterials = (seed = 9127, size = 512): ProceduralLogMater
       aoData[p + 2] = aoData[p];
       aoData[p + 3] = 255;
 
-      const crackBand = Math.pow(clamp((0.44 - ridgeMask) / 0.44, 0.0, 1.0), 2.6);
+      const crackBand = Math.pow(clamp((0.5 - ridgeMask) / 0.5, 0.0, 1.0), 2.2);
       const crackNoise = fbm2(u * 26.0 + 1.4, v * 19.0 - 0.7, seed + 317, 2);
       const crack = clamp(crackBand * (0.4 + 0.8 * crackNoise) + knot * 0.45 + char * 0.25, 0.0, 1.0);
       const crackByte = clamp(Math.round(crack * 255), 0, 255);
@@ -2280,6 +2502,9 @@ const makeProceduralLogMaterials = (seed = 9127, size = 512): ProceduralLogMater
   const colorMap = new THREE.DataTexture(colorData, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
   colorMap.wrapS = THREE.RepeatWrapping;
   colorMap.wrapT = THREE.RepeatWrapping;
+  colorMap.generateMipmaps = true;
+  colorMap.minFilter = THREE.LinearMipmapLinearFilter;
+  colorMap.magFilter = THREE.LinearFilter;
   colorMap.anisotropy = 8;
   colorMap.colorSpace = THREE.SRGBColorSpace;
   colorMap.needsUpdate = true;
@@ -2287,6 +2512,9 @@ const makeProceduralLogMaterials = (seed = 9127, size = 512): ProceduralLogMater
   const normalMap = new THREE.DataTexture(normalData, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
   normalMap.wrapS = THREE.RepeatWrapping;
   normalMap.wrapT = THREE.RepeatWrapping;
+  normalMap.generateMipmaps = true;
+  normalMap.minFilter = THREE.LinearMipmapLinearFilter;
+  normalMap.magFilter = THREE.LinearFilter;
   normalMap.anisotropy = 8;
   normalMap.colorSpace = THREE.NoColorSpace;
   normalMap.needsUpdate = true;
@@ -2294,6 +2522,9 @@ const makeProceduralLogMaterials = (seed = 9127, size = 512): ProceduralLogMater
   const roughnessMap = new THREE.DataTexture(roughnessData, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
   roughnessMap.wrapS = THREE.RepeatWrapping;
   roughnessMap.wrapT = THREE.RepeatWrapping;
+  roughnessMap.generateMipmaps = true;
+  roughnessMap.minFilter = THREE.LinearMipmapLinearFilter;
+  roughnessMap.magFilter = THREE.LinearFilter;
   roughnessMap.anisotropy = 8;
   roughnessMap.colorSpace = THREE.NoColorSpace;
   roughnessMap.needsUpdate = true;
@@ -2301,6 +2532,9 @@ const makeProceduralLogMaterials = (seed = 9127, size = 512): ProceduralLogMater
   const aoMap = new THREE.DataTexture(aoData, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
   aoMap.wrapS = THREE.RepeatWrapping;
   aoMap.wrapT = THREE.RepeatWrapping;
+  aoMap.generateMipmaps = true;
+  aoMap.minFilter = THREE.LinearMipmapLinearFilter;
+  aoMap.magFilter = THREE.LinearFilter;
   aoMap.anisotropy = 8;
   aoMap.colorSpace = THREE.NoColorSpace;
   aoMap.needsUpdate = true;
@@ -2308,6 +2542,9 @@ const makeProceduralLogMaterials = (seed = 9127, size = 512): ProceduralLogMater
   const crackMap = new THREE.DataTexture(crackData, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
   crackMap.wrapS = THREE.RepeatWrapping;
   crackMap.wrapT = THREE.RepeatWrapping;
+  crackMap.generateMipmaps = true;
+  crackMap.minFilter = THREE.LinearMipmapLinearFilter;
+  crackMap.magFilter = THREE.LinearFilter;
   crackMap.anisotropy = 8;
   crackMap.colorSpace = THREE.NoColorSpace;
   crackMap.needsUpdate = true;
@@ -2325,7 +2562,7 @@ const makeProceduralLogMaterials = (seed = 9127, size = 512): ProceduralLogMater
     emissive: 0xff6a29,
     emissiveIntensity: 0.04,
   });
-  side.normalScale.set(0.85, 0.85);
+  side.normalScale.set(0.6, 0.6);
 
   const cap = new THREE.MeshPhysicalMaterial({
     color: 0xb18b67,
@@ -2340,48 +2577,54 @@ const makeProceduralLogMaterials = (seed = 9127, size = 512): ProceduralLogMater
   return { side, cap, crackMap, textures: [colorMap, normalMap, roughnessMap, aoMap, crackMap] };
 };
 
-const makeProceduralLogGeometry = (length: number, radius: number, seed: number) => {
-  const geometry = new THREE.CylinderGeometry(radius * 0.95, radius * 1.03, length, 72, 40, false);
-  const position = geometry.getAttribute('position') as THREE.BufferAttribute;
-  const point = new THREE.Vector3();
+const makeProceduralLogObject = (
+  length: number,
+  radius: number,
+  seed: number,
+  materials: { side: THREE.MeshPhysicalMaterial; cap: THREE.MeshPhysicalMaterial }
+) => {
+  // Boundary correctness: fire occlusion + wood coupling use an analytic capsule SDF.
+  // The procedural fallback mesh must match that capsule shape closely, or you'll
+  // see a visible air-gap (SDF bigger than mesh => fire occluded early).
+  //
+  // SDF capsule segment uses endpoints separated by `length` and radius `radius`.
+  // Create a matching mesh: cylinder of height `length` + spheres at +/-length/2.
   const random = createSeededRandom(seed);
-  const bendX = (random() - 0.5) * length * 0.05;
-  const bendZ = (random() - 0.5) * length * 0.04;
+  const group = new THREE.Group();
 
-  for (let i = 0; i < position.count; i++) {
-    point.fromBufferAttribute(position, i);
-    const y01 = point.y / Math.max(1e-6, length) + 0.5;
-    const radial = Math.hypot(point.x, point.z);
-    if (radial > 1e-6) {
-      const angle = Math.atan2(point.z, point.x);
-      const u = angle / (Math.PI * 2) + 0.5;
-      const ridge = fbm2(u * 10.5 + 0.3, y01 * 3.8 - 0.1, seed + 17, 4);
-      const groove = Math.pow(Math.abs(Math.sin((u + fbm2(u * 3.7, y01 * 6.2, seed + 31, 2) * 0.12) * Math.PI * 26.0)), 2.6);
-      const knot = Math.pow(clamp((fbm2(u * 6.0 - 1.7, y01 * 10.0 + 0.9, seed + 79, 3) - 0.82) / 0.18, 0.0, 1.0), 2.0);
-      const end = Math.pow(Math.abs(y01 * 2.0 - 1.0), 2.8);
-      const taper = 1.0 - end * 0.22;
-      const scale = clamp(taper + (ridge - 0.5) * 0.22 + (0.5 - groove) * 0.08 + knot * 0.12, 0.72, 1.42);
-      const target = radial * scale;
-      const inv = target / radial;
-      point.x *= inv;
-      point.z *= inv;
+  const radialSegments = 72;
+  const heightSegments = 24;
+  const cylinderGeo = new THREE.CylinderGeometry(radius, radius, length, radialSegments, heightSegments, true);
+  const cylinder = new THREE.Mesh(cylinderGeo, materials.side);
+  cylinder.castShadow = false;
+  cylinder.receiveShadow = false;
+  group.add(cylinder);
+
+  const sphereGeo = new THREE.SphereGeometry(radius, 40, 24);
+  const capA = new THREE.Mesh(sphereGeo, materials.cap);
+  capA.position.y = length * 0.5;
+  capA.castShadow = false;
+  capA.receiveShadow = false;
+  group.add(capA);
+
+  const capB = new THREE.Mesh(sphereGeo, materials.cap);
+  capB.position.y = -length * 0.5;
+  capB.castShadow = false;
+  capB.receiveShadow = false;
+  group.add(capB);
+
+  // Small visual variation that does NOT change the capsule silhouette.
+  group.rotation.y = (random() - 0.5) * 0.08;
+
+  // Ensure uv2 exists for AO/roughness workflows if materials use it.
+  for (const geo of [cylinderGeo, sphereGeo]) {
+    const uv = geo.getAttribute('uv') as THREE.BufferAttribute | undefined;
+    if (uv && !geo.getAttribute('uv2')) {
+      geo.setAttribute('uv2', new THREE.BufferAttribute(new Float32Array(uv.array as ArrayLike<number>), 2));
     }
-
-    const bendT = Math.sin(y01 * Math.PI);
-    point.x += bendX * bendT;
-    point.z += bendZ * bendT;
-    point.y += (fbm2(y01 * 12.0 + 0.3, seed * 0.013 + 2.1, seed + 101, 2) - 0.5) * radius * 0.18;
-    position.setXYZ(i, point.x, point.y, point.z);
   }
 
-  position.needsUpdate = true;
-  geometry.computeVertexNormals();
-
-  const uv = geometry.getAttribute('uv') as THREE.BufferAttribute | undefined;
-  if (uv) {
-    geometry.setAttribute('uv2', new THREE.BufferAttribute(new Float32Array(uv.array as ArrayLike<number>), 2));
-  }
-  return geometry;
+  return group;
 };
 
 const applyFallbackLogMaterial = (root: THREE.Object3D) => {
@@ -2412,14 +2655,46 @@ const applyFallbackLogMaterial = (root: THREE.Object3D) => {
 };
 
 const normalizeLogSource = (source: THREE.Object3D) => {
+  // Normalize scanned-log source so its *long axis* aligns with +Y and its center is at the origin.
+  // Per-instance scaling (length/radius) is applied later when the pile is instanced.
   source.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(source);
-  const size = box.getSize(new THREE.Vector3());
-  const center = box.getCenter(new THREE.Vector3());
-  source.position.sub(center);
-  const maxExtent = Math.max(size.x, size.y, size.z, 1e-4);
-  const scale = 0.36 / maxExtent;
-  source.scale.setScalar(scale);
+
+  // Center at origin first.
+  {
+    const box = new THREE.Box3().setFromObject(source);
+    const center = box.getCenter(new THREE.Vector3());
+    source.position.sub(center);
+  }
+
+  // Align the dominant extent to Y (assumes the log model is roughly axis-aligned).
+  source.updateMatrixWorld(true);
+  {
+    const box = new THREE.Box3().setFromObject(source);
+    const size = box.getSize(new THREE.Vector3());
+    const extents = [size.x, size.y, size.z];
+    const maxExtent = Math.max(extents[0], extents[1], extents[2]);
+    const maxAxis = extents.findIndex((v) => v === maxExtent);
+
+    const q = new THREE.Quaternion();
+    if (maxAxis === 0) {
+      // X is dominant: rotate +90° about Z so X -> Y.
+      q.setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI * 0.5);
+      source.applyQuaternion(q);
+    } else if (maxAxis === 2) {
+      // Z is dominant: rotate -90° about X so Z -> Y.
+      q.setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI * 0.5);
+      source.applyQuaternion(q);
+    }
+  }
+
+  // Re-center after rotation.
+  source.updateMatrixWorld(true);
+  {
+    const box = new THREE.Box3().setFromObject(source);
+    const center = box.getCenter(new THREE.Vector3());
+    source.position.sub(center);
+  }
+
   source.updateMatrixWorld(true);
 };
 
@@ -2430,13 +2705,13 @@ const addFallbackLogPile = (
   const transforms = getWoodLogTransforms(WOOD_PILE_DESCRIPTOR);
 
   for (const transform of transforms) {
-    const geometry = makeProceduralLogGeometry(transform.length, transform.radius, transform.seed + 17);
-    const mesh = new THREE.Mesh(geometry, [materialSet.side, materialSet.cap, materialSet.cap]);
-    mesh.position.copy(transform.position);
-    mesh.rotation.copy(transform.rotation);
-    mesh.castShadow = false;
-    mesh.receiveShadow = false;
-    scene.add(mesh);
+    const obj = makeProceduralLogObject(transform.length, transform.radius, transform.seed + 17, {
+      side: materialSet.side,
+      cap: materialSet.cap,
+    });
+    obj.position.copy(transform.position);
+    obj.rotation.copy(transform.rotation);
+    scene.add(obj);
   }
 
   return { textures: materialSet.textures, sideMaterial: materialSet.side, capMaterial: materialSet.cap };
@@ -2457,6 +2732,37 @@ const loadTextureSafe = async (
   } catch {
     return null;
   }
+};
+
+type FireSimStatus = {
+  ready: boolean;
+  frame: number;
+  grid: number;
+  scene: number;
+  smoke: 0 | 1;
+  error: string | null;
+  warning: string | null;
+};
+
+type FireSimFuzzResult = {
+  runtimeError: string | null;
+  finalParams: Record<string, unknown>;
+};
+
+type FireSimControl = {
+  setScene: (id: number) => void;
+  setGrid: (size: number) => void;
+  setSmoke: (enabled: boolean) => void;
+  setPlaying: (playing: boolean) => void;
+  setParams: (patch: Partial<Record<string, number>>) => void;
+  step: (frames?: number) => Promise<void>;
+  runFuzz: (options: { iterations: number; seed: number }) => Promise<FireSimFuzzResult>;
+};
+
+type FireSimHarnessConfig = {
+  deterministic: boolean;
+  sweep: boolean;
+  maxFrames: number | null;
 };
 
 const FluidSimulation: React.FC = () => {
@@ -2484,6 +2790,19 @@ const FluidSimulation: React.FC = () => {
     worldMs: 0,
     compositeMs: 0,
     substeps: 0,
+    gpuAdvectMs: null,
+    gpuDivergenceMs: null,
+    gpuJacobiMs: null,
+    gpuGradientMs: null,
+    gpuRaymarchMs: null,
+    gpuTotalMs: null,
+    avgRaySteps: null,
+    fieldSampledVoxels: null,
+    fieldAvgTemp: null,
+    fieldPeakTemp: null,
+    fieldAvgSoot: null,
+    fieldDivL1: null,
+    fieldReactionFraction: null,
   });
   const [selectedSceneId, setSelectedSceneId] = useState(0);
   const [activeSlot, setActiveSlot] = useState<PresetSlot>('A');
@@ -2502,7 +2821,22 @@ const FluidSimulation: React.FC = () => {
   });
   const readPixelRatio = () => Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
   const [dimensions, setDimensions] = useState({ width: window.innerWidth, height: window.innerHeight, pixelRatio: readPixelRatio() });
-  const [gridSize, setGridSize] = useState(128);
+
+  const readInitialGridSize = () => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const gridParam = params.get('grid');
+      if (!gridParam) return 128;
+      const parsed = Number.parseInt(gridParam, 10);
+      if (!Number.isFinite(parsed)) return 128;
+      const allowed = [64, 128, 192, 256];
+      return allowed.includes(parsed) ? parsed : 128;
+    } catch {
+      return 128;
+    }
+  };
+
+  const [gridSize, setGridSize] = useState(readInitialGridSize);
   const [runtimeResolutionScale, setRuntimeResolutionScale] = useState(1);
   const [simParams, setSimParams] = useState<SimParamState>({ ...INITIAL_PARAMS });
   const [lockedParams, setLockedParams] = useState<Record<EditableParamKey, boolean>>(() => (
@@ -2544,6 +2878,33 @@ const FluidSimulation: React.FC = () => {
   const worldNeedsRenderRef = useRef(true);
   const renderWorldRef = useRef<(() => number) | null>(null);
 
+  const harnessConfigRef = useRef<FireSimHarnessConfig>({ deterministic: false, sweep: false, maxFrames: null });
+  const harnessStatusRef = useRef<FireSimStatus>({
+    ready: false,
+    frame: 0,
+    grid: 128,
+    scene: 0,
+    smoke: 1,
+    error: null,
+    warning: null,
+  });
+  const simFrameRef = useRef(0);
+  const errorRef = useRef<string | null>(null);
+  const warningRef = useRef<string | null>(null);
+  const controlRef = useRef<FireSimControl | null>(null);
+
+  const recomputeHarnessReady = useCallback((frame: number) => {
+    const cfg = harnessConfigRef.current;
+    const hasError = Boolean(errorRef.current);
+    if (hasError) return false;
+
+    if (cfg.deterministic && cfg.sweep && typeof cfg.maxFrames === 'number') {
+      return frame >= cfg.maxFrames;
+    }
+
+    return frame > 0;
+  }, []);
+
   const markWorldDirty = useCallback(() => {
     worldNeedsRenderRef.current = true;
   }, []);
@@ -2558,11 +2919,76 @@ const FluidSimulation: React.FC = () => {
   useEffect(() => { fireOverlayModeRef.current = fireOverlayMode; }, [fireOverlayMode]);
   useEffect(() => { markWorldDirty(); }, [markWorldDirty, simParams, compositionMode, dimensions.width, dimensions.height, dimensions.pixelRatio]);
 
+  useEffect(() => {
+    errorRef.current = error;
+    harnessStatusRef.current.error = error;
+    harnessStatusRef.current.ready = recomputeHarnessReady(simFrameRef.current);
+  }, [error, recomputeHarnessReady]);
+
+  useEffect(() => {
+    warningRef.current = runtimeWarning;
+    harnessStatusRef.current.warning = runtimeWarning;
+  }, [runtimeWarning]);
+
+  useEffect(() => {
+    harnessStatusRef.current.grid = gridSize;
+  }, [gridSize]);
+
+  useEffect(() => {
+    harnessStatusRef.current.scene = selectedSceneId;
+  }, [selectedSceneId]);
+
+  useEffect(() => {
+    harnessStatusRef.current.smoke = isSmokeEnabled ? 1 : 0;
+  }, [isSmokeEnabled]);
+
   const pushTimeline = useCallback((message: string) => {
     const item: TimelineEvent = { id: timelineIdRef.current, at: Date.now(), message };
     timelineIdRef.current += 1;
     setTimeline((prev) => [item, ...prev].slice(0, 60));
   }, []);
+
+  // Runtime log: high-volume ring buffer for copy/paste debugging.
+  const runtimeLogRef = useRef<string[]>([]);
+  const runtimeLogCharsRef = useRef<number>(0);
+  const runtimeLogSessionIdRef = useRef<string>(`${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const RUNTIME_LOG_MAX_LINES = 6000;
+  const RUNTIME_LOG_MAX_CHARS = 900_000;
+
+  const appendRuntimeLog = useCallback((line: string) => {
+    // Keep it extremely defensive; logging should never break rendering.
+    try {
+      const safeLine = String(line);
+      runtimeLogRef.current.push(safeLine);
+      runtimeLogCharsRef.current += safeLine.length + 1;
+
+      while (
+        runtimeLogRef.current.length > RUNTIME_LOG_MAX_LINES ||
+        runtimeLogCharsRef.current > RUNTIME_LOG_MAX_CHARS
+      ) {
+        const removed = runtimeLogRef.current.shift();
+        if (removed) runtimeLogCharsRef.current -= removed.length + 1;
+        else break;
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const getRuntimeLogText = useCallback(() => {
+      const woodAssetState = worldRuntimeRef.current?.woodAssetState ?? 'no_asset';
+      const woodAssetSource = worldRuntimeRef.current?.woodAssetSource ?? '-';
+    const header = [
+      `firesim-runtime-log.v1`,
+      `sessionId=${runtimeLogSessionIdRef.current}`,
+      `copiedAt=${new Date().toISOString()}`,
+        `sceneId=${selectedSceneId} gridSize=${gridSize} quality=${qualityMode} smoke=${isSmokeEnabled ? 1 : 0}`,
+        `occlusion=${fireOcclusionModeRef.current} overlay=${fireOverlayModeRef.current} composition=${compositionModeRef.current}`,
+        `woodAssetState=${woodAssetState} woodAssetSource=${woodAssetSource}`,
+      `---`,
+    ].join('\n');
+    return `${header}\n${runtimeLogRef.current.join('\n')}`;
+  }, [gridSize, isSmokeEnabled, qualityMode, selectedSceneId]);
 
   const copyText = useCallback(async (text: string, successMessage: string) => {
     try {
@@ -2573,10 +2999,36 @@ const FluidSimulation: React.FC = () => {
     }
   }, [pushTimeline]);
 
+  const copyRuntimeLogToClipboard = useCallback(() => {
+    void copyText(getRuntimeLogText(), 'Copied runtime log');
+  }, [copyText, getRuntimeLogText]);
+
   useEffect(() => {
     const handleResize = () => setDimensions({ width: window.innerWidth, height: window.innerHeight, pixelRatio: readPixelRatio() });
     window.addEventListener('resize', handleResize); return () => window.removeEventListener('resize', handleResize);
   }, []);
+
+  const handleSceneChange = useCallback((id: number) => {
+    setSelectedSceneId(id);
+    sceneRef.current = id;
+    const scene = SCENES.find(s => s.id === id);
+    if (scene) {
+      setTuningMacroKnobs((prev) => ({
+        ...prev,
+        smokeAmount: deriveSmokeAmountT(scene.params),
+        turbulenceCharacter: deriveTurbulenceCharacterT(scene.params),
+      }));
+      setSimParams((prev) => ({
+        ...prev,
+        ...FLOOR_LIGHTING_DEFAULTS,
+        ...scene.params,
+        exposure: scene.params.exposure ?? prev.exposure ?? 1,
+        gamma: scene.params.gamma ?? prev.gamma ?? 2.2,
+        timeStep: DEFAULT_TIME_STEP,
+      }));
+      pushTimeline(`Scenario changed to ${scene.name}`);
+    }
+  }, [deriveSmokeAmountT, deriveTurbulenceCharacterT, pushTimeline]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -2600,28 +3052,170 @@ const FluidSimulation: React.FC = () => {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [selectedSceneId]);
+  }, [handleSceneChange, selectedSceneId]);
 
-  const handleSceneChange = (id: number) => {
-    setSelectedSceneId(id);
-    const scene = SCENES.find(s => s.id === id);
-    if (scene) {
-      setTuningMacroKnobs((prev) => ({
-        ...prev,
-        smokeAmount: deriveSmokeAmountT(scene.params),
-        turbulenceCharacter: deriveTurbulenceCharacterT(scene.params),
-      }));
-      setSimParams((prev) => ({
-        ...prev,
-        ...FLOOR_LIGHTING_DEFAULTS,
-        ...scene.params,
-        exposure: scene.params.exposure ?? prev.exposure ?? 1,
-        gamma: scene.params.gamma ?? prev.gamma ?? 2.2,
-        timeStep: DEFAULT_TIME_STEP,
-      }));
-      pushTimeline(`Scenario changed to ${scene.name}`);
+  useEffect(() => {
+    if (controlRef.current) return;
+
+    const clampGrid = (value: number) => ([64, 128, 192, 256] as const).includes(value as any) ? value : 128;
+
+    const step = async (frames = 1) => {
+      const safeFrames = Math.max(0, Math.floor(frames));
+      if (safeFrames === 0) return;
+
+      setIsPlaying(false);
+      playingRef.current = false;
+
+      const startFrame = simFrameRef.current;
+      const target = startFrame + safeFrames;
+      stepFramesRef.current += safeFrames;
+
+      const timeoutMs = 30_000;
+      const startMs = performance.now();
+      await new Promise<void>((resolve, reject) => {
+        const tick = () => {
+          if (errorRef.current) {
+            reject(new Error(String(errorRef.current)));
+            return;
+          }
+          if (simFrameRef.current >= target) {
+            resolve();
+            return;
+          }
+          if (performance.now() - startMs > timeoutMs) {
+            reject(new Error('Timed out waiting for step()'));
+            return;
+          }
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      });
+    };
+
+    const xorshift32 = (seed: number) => {
+      let x = seed | 0;
+      return () => {
+        x ^= x << 13;
+        x ^= x >>> 17;
+        x ^= x << 5;
+        return (x >>> 0) / 0x1_0000_0000;
+      };
+    };
+
+    const setParams = (patch: Partial<Record<string, number>>) => {
+      const next: SimParamState = { ...paramsRef.current } as SimParamState;
+      for (const [key, raw] of Object.entries(patch)) {
+        if (!(key in (PARAM_SPEC_BY_KEY as any))) continue;
+        const spec = (PARAM_SPEC_BY_KEY as any)[key] as { min: number; max: number };
+        const value = typeof raw === 'number' ? raw : Number(raw);
+        if (!Number.isFinite(value)) continue;
+        (next as any)[key] = clamp(value, spec.min, spec.max);
+      }
+      paramsRef.current = next;
+      setSimParams(next);
+    };
+
+    const runFuzz = async ({ iterations, seed }: { iterations: number; seed: number }) => {
+      const rng = xorshift32(seed);
+      const keys: EditableParamKey[] = ['stepQuality', 'drag', 'absorption', 'gamma', 'smokeDissipation'];
+
+      let runtimeError: string | null = null;
+      const iters = Math.max(0, Math.floor(iterations));
+      for (let i = 0; i < iters; i++) {
+        if (errorRef.current) {
+          runtimeError = String(errorRef.current);
+          break;
+        }
+
+        const patch: Partial<Record<string, number>> = {};
+        const pickCount = 1 + Math.floor(rng() * 3);
+        for (let j = 0; j < pickCount; j++) {
+          const key = keys[Math.floor(rng() * keys.length)];
+          const spec = PARAM_SPEC_BY_KEY[key];
+          const v = spec.min + (spec.max - spec.min) * rng();
+          patch[key] = v;
+        }
+        setParams(patch);
+        await step(1);
+      }
+
+      return {
+        runtimeError,
+        finalParams: { ...paramsRef.current, timeStep: DEFAULT_TIME_STEP },
+      } satisfies FireSimFuzzResult;
+    };
+
+    const control: FireSimControl = {
+      setScene: (id) => handleSceneChange(id),
+      setGrid: (size) => setGridSize(clampGrid(Math.floor(size))),
+      setSmoke: (enabled) => setIsSmokeEnabled(Boolean(enabled)),
+      setPlaying: (playing) => setIsPlaying(Boolean(playing)),
+      setParams,
+      step,
+      runFuzz,
+    };
+
+    controlRef.current = control;
+    const w = window as any;
+    w.__FIRE_SIM_STATUS__ = harnessStatusRef.current;
+    w.__FIRE_SIM_CONTROL__ = control;
+    w.__FIRE_SIM_LOG__ = () => getRuntimeLogText();
+
+    return () => {
+      if ((window as any).__FIRE_SIM_CONTROL__ === control) delete (window as any).__FIRE_SIM_CONTROL__;
+      if ((window as any).__FIRE_SIM_STATUS__ === harnessStatusRef.current) delete (window as any).__FIRE_SIM_STATUS__;
+      if ((window as any).__FIRE_SIM_LOG__) delete (window as any).__FIRE_SIM_LOG__;
+    };
+  }, [getRuntimeLogText, handleSceneChange]);
+
+  useEffect(() => {
+    // URL-driven harness config (used by Playwright stability + AI harness)
+    const params = new URLSearchParams(window.location.search);
+    const deterministic = params.get('deterministic') === '1';
+    const sweep = params.get('sweep') === '1';
+    const sceneParam = params.get('scene');
+    const gridParam = params.get('grid');
+    const smokeParam = params.get('smoke');
+    const maxFramesParam = params.get('maxFrames');
+
+    const cfg: FireSimHarnessConfig = {
+      deterministic,
+      sweep,
+      maxFrames: null,
+    };
+    if (maxFramesParam) {
+      const parsed = Number.parseInt(maxFramesParam, 10);
+      if (Number.isFinite(parsed) && parsed >= 0) cfg.maxFrames = Math.min(parsed, 50_000);
     }
-  };
+    harnessConfigRef.current = cfg;
+
+    if (gridParam) {
+      const parsed = Number.parseInt(gridParam, 10);
+      if (Number.isFinite(parsed)) {
+        const allowed = [64, 128, 192, 256];
+        const next = allowed.includes(parsed) ? parsed : gridSize;
+        if (next !== gridSize) setGridSize(next);
+      }
+    }
+
+    if (sceneParam) {
+      const parsed = Number.parseInt(sceneParam, 10);
+      if (Number.isFinite(parsed)) handleSceneChange(parsed);
+    }
+
+    if (smokeParam) {
+      const parsed = Number.parseInt(smokeParam, 10);
+      if (parsed === 0 || parsed === 1) setIsSmokeEnabled(Boolean(parsed));
+    }
+
+    if (cfg.deterministic && cfg.sweep && typeof cfg.maxFrames === 'number') {
+      setIsPlaying(false);
+      playingRef.current = false;
+      stepFramesRef.current = cfg.maxFrames;
+      harnessStatusRef.current.ready = recomputeHarnessReady(simFrameRef.current);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const resetPreset = useCallback(() => {
     const scene = SCENES.find((entry) => entry.id === selectedSceneId) ?? SCENES[0];
@@ -2660,7 +3254,7 @@ const FluidSimulation: React.FC = () => {
 
   const resetParamToSceneDefault = useCallback((key: EditableParamKey) => {
     const scene = SCENES.find((entry) => entry.id === selectedSceneId) ?? SCENES[0];
-    const sceneValue = scene.params[key];
+    const sceneValue = (scene.params as any)[key];
     const fallback = INITIAL_PARAMS[key];
     const next = Number.isFinite(sceneValue as number) ? Number(sceneValue) : Number(fallback);
     updateParam(key, next);
@@ -2850,10 +3444,19 @@ const FluidSimulation: React.FC = () => {
       if (logAsset.textures?.length) textures.push(...logAsset.textures);
       if (logAsset.assetState === 'scanned_asset_ready') {
         pushTimeline(`AssetSystem ${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} (${logAsset.source})`);
+        appendRuntimeLog(
+          `world: woodAssetState=${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} source=${logAsset.source ?? '-'} baseLen=${(logAsset.normalizedLogBaseLength ?? 0).toFixed(4)} baseRad=${(logAsset.normalizedLogBaseRadius ?? 0).toFixed(4)} note=scanned_instances_scaled_to_descriptor`
+        );
       } else if (logAsset.assetState === 'procedural_fallback') {
         pushTimeline(`AssetSystem ${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} (${logAsset.reason ?? 'fallback'})`);
+        appendRuntimeLog(
+          `world: woodAssetState=${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} reason=${logAsset.reason ?? 'fallback'} note=procedural_capsule_mesh_matches_sdf_descriptor`
+        );
       } else {
         pushTimeline(`AssetSystem ${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} (${logAsset.reason ?? 'no_asset'})`);
+        appendRuntimeLog(
+          `world: woodAssetState=${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} reason=${logAsset.reason ?? 'no_asset'}`
+        );
       }
       const logCharSideColor = new THREE.Color(0x18110d);
       const logCharCapColor = new THREE.Color(0x24160f);
@@ -3027,35 +3630,127 @@ const FluidSimulation: React.FC = () => {
         renderWorldRef,
       },
       onStats: setStats,
+      onFrame: (frame) => {
+        simFrameRef.current = frame;
+        harnessStatusRef.current.frame = frame;
+        harnessStatusRef.current.ready = recomputeHarnessReady(frame);
+      },
       onRuntimeWarning: setRuntimeWarning,
       onError: (message) => setError(message),
       onGridUnsupported: (nextGrid) => {
-        pushTimeline(`Grid ${gridSize} exceeded max storage binding; falling back to ${nextGrid}.`);
+        pushTimeline(`Grid ${gridSize} unsupported; falling back to ${nextGrid}.`);
         setGridSize(nextGrid);
       },
       pushTimeline,
-      createResources: (device, format, size) => {
+      onLog: (line) => {
+        appendRuntimeLog(line);
+      },
+      createResources: async (device, format, size) => {
         const transport = new FluidTransport(device, size);
-        const computePipeline = device.createComputePipeline({
-          layout: transport.physicsContract.layout,
-          compute: { module: device.createShaderModule({ code: COMPUTE_SHADER }), entryPoint: 'main' },
+
+        const createComputePipeline = async (desc: GPUComputePipelineDescriptor) => {
+          const maybeAsync = (device as any).createComputePipelineAsync as
+            | ((descriptor: GPUComputePipelineDescriptor) => Promise<GPUComputePipeline>)
+            | undefined;
+          if (maybeAsync) return maybeAsync.call(device, desc);
+          return device.createComputePipeline(desc);
+        };
+
+        const createRenderPipeline = async (desc: GPURenderPipelineDescriptor) => {
+          const maybeAsync = (device as any).createRenderPipelineAsync as
+            | ((descriptor: GPURenderPipelineDescriptor) => Promise<GPURenderPipeline>)
+            | undefined;
+          if (maybeAsync) return maybeAsync.call(device, desc);
+          return device.createRenderPipeline(desc);
+        };
+
+        const computeModule = device.createShaderModule({ code: COMPUTE_SHADER });
+        const projectionDivModule = device.createShaderModule({ code: PROJECTION_DIVERGENCE_SHADER });
+        const projectionJacobiModule = device.createShaderModule({ code: PROJECTION_JACOBI_SHADER });
+        const projectionGradModule = device.createShaderModule({ code: PROJECTION_GRADIENT_SHADER });
+        const occupancyModule = device.createShaderModule({ code: OCCUPANCY_SHADER });
+        const renderModule = device.createShaderModule({ code: RENDER_SHADER });
+
+        const [
+          computePipeline,
+          projectionDivPipeline,
+          projectionJacobiPipeline,
+          projectionGradPipeline,
+          occupancyPipeline,
+          renderPipeline,
+        ] = await Promise.all([
+          createComputePipeline({
+            layout: transport.physicsContract.layout,
+            compute: { module: computeModule, entryPoint: 'main' },
+          }),
+          createComputePipeline({
+            layout: transport.projectionDivContract.layout,
+            compute: { module: projectionDivModule, entryPoint: 'main' },
+          }),
+          createComputePipeline({
+            layout: transport.projectionJacobiContract.layout,
+            compute: { module: projectionJacobiModule, entryPoint: 'main' },
+          }),
+          createComputePipeline({
+            layout: transport.projectionGradContract.layout,
+            compute: { module: projectionGradModule, entryPoint: 'main' },
+          }),
+          createComputePipeline({
+            layout: transport.occupancyContract.layout,
+            compute: { module: occupancyModule, entryPoint: 'main' },
+          }),
+          createRenderPipeline({
+            layout: transport.renderContract.layout,
+            vertex: { module: renderModule, entryPoint: 'vert_main' },
+            fragment: { module: renderModule, entryPoint: 'frag_main', targets: [{ format }] },
+            primitive: { topology: 'triangle-list' },
+          }),
+        ]);
+
+        // Task D: Half-res upsample pipeline
+        const upsampleBindGroupLayout = device.createBindGroupLayout({
+          entries: [
+            { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+            { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+          ],
+          label: 'Upsample_BGL',
         });
-        const projectionDivPipeline = device.createComputePipeline({
-          layout: transport.projectionDivContract.layout,
-          compute: { module: device.createShaderModule({ code: PROJECTION_DIVERGENCE_SHADER }), entryPoint: 'main' },
+        const upsamplePipelineLayout = device.createPipelineLayout({
+          bindGroupLayouts: [upsampleBindGroupLayout],
+          label: 'Upsample_PL',
         });
-        const projectionJacobiPipeline = device.createComputePipeline({
-          layout: transport.projectionJacobiContract.layout,
-          compute: { module: device.createShaderModule({ code: PROJECTION_JACOBI_SHADER }), entryPoint: 'main' },
+        const upsampleModule = device.createShaderModule({ code: UPSAMPLE_SHADER });
+        const upsamplePipeline = await createRenderPipeline({
+          layout: upsamplePipelineLayout,
+          vertex: { module: upsampleModule, entryPoint: 'vert_main' },
+          fragment: {
+            module: upsampleModule, entryPoint: 'frag_main',
+            targets: [{
+              format,
+              blend: {
+                color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+              },
+            }],
+          },
+          primitive: { topology: 'triangle-list' },
         });
-        const projectionGradPipeline = device.createComputePipeline({
-          layout: transport.projectionGradContract.layout,
-          compute: { module: device.createShaderModule({ code: PROJECTION_GRADIENT_SHADER }), entryPoint: 'main' },
+        const upsampleSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+
+        // Task E: Temporal blend pipeline
+        const temporalBlendBGL = device.createBindGroupLayout({
+          entries: [
+            { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+            { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+            { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+          ],
+          label: 'TemporalBlend_BGL',
         });
-        const renderPipeline = device.createRenderPipeline({
-          layout: transport.renderContract.layout,
-          vertex: { module: device.createShaderModule({ code: RENDER_SHADER }), entryPoint: 'vert_main' },
-          fragment: { module: device.createShaderModule({ code: RENDER_SHADER }), entryPoint: 'frag_main', targets: [{ format }] },
+        const temporalBlendModule = device.createShaderModule({ code: TEMPORAL_BLEND_SHADER });
+        const temporalBlendPipeline = await createRenderPipeline({
+          layout: device.createPipelineLayout({ bindGroupLayouts: [temporalBlendBGL], label: 'TemporalBlend_PL' }),
+          vertex: { module: temporalBlendModule, entryPoint: 'vert_main' },
+          fragment: { module: temporalBlendModule, entryPoint: 'frag_main', targets: [{ format }] },
           primitive: { topology: 'triangle-list' },
         });
 
@@ -3065,7 +3760,13 @@ const FluidSimulation: React.FC = () => {
           projectionDivPipeline,
           projectionJacobiPipeline,
           projectionGradPipeline,
+          occupancyPipeline,
           renderPipeline,
+          upsamplePipeline,
+          upsampleBindGroupLayout,
+          upsampleSampler,
+          temporalBlendPipeline,
+          temporalBlendBGL,
         };
       },
       updateUniforms: (transport, now, input: UniformUpdateInput) => {
@@ -3351,7 +4052,7 @@ f32(284, occlusionStepBudget);
     const scene = SCENES.find((entry) => entry.id === selectedSceneId) ?? SCENES[0];
     const defaults = {} as Record<EditableParamKey, number>;
     PARAM_SPECS.forEach((spec) => {
-      const sceneValue = scene.params[spec.key];
+      const sceneValue = (scene.params as any)[spec.key];
       defaults[spec.key] = Number.isFinite(sceneValue as number) ? Number(sceneValue) : Number(INITIAL_PARAMS[spec.key]);
     });
     return defaults;
@@ -3386,6 +4087,11 @@ f32(284, occlusionStepBudget);
   const fireMs = stats.fireMs || 0;
   const worldMs = stats.worldMs || 0;
   const compositeMs = stats.compositeMs || 0;
+  const gpuTotalMs = stats.gpuTotalMs;
+  const gpuAdvectMs = stats.gpuAdvectMs;
+  const gpuJacobiMs = stats.gpuJacobiMs;
+  const gpuRaymarchMs = stats.gpuRaymarchMs;
+  const avgRaySteps = stats.avgRaySteps;
   const activeBudget = QUALITY_BUDGETS[qualityMode];
   const rayStepBudget = Math.max(
     24,
@@ -3846,6 +4552,9 @@ f32(284, occlusionStepBudget);
           <button type="button" className="deck-tool" aria-label="Copy params" onClick={copyParamsToClipboard}>
             <Copy size={16} />
           </button>
+          <button type="button" className="deck-tool" aria-label="Copy runtime log" onClick={copyRuntimeLogToClipboard}>
+            <Keyboard size={16} />
+          </button>
           <button type="button" className="deck-tool" aria-label="Copy algorithm" onClick={copyAlgorithmToClipboard}>
             <Zap size={16} />
           </button>
@@ -4070,6 +4779,33 @@ f32(284, occlusionStepBudget);
               <div className="deck-meter-row"><span>Composite</span><span>{compositeMs.toFixed(1)} ms</span></div>
               <div className="deck-meter-track"><div className="deck-meter-fill is-secondary" style={{ width: `${frameTime > 0 ? clamp(compositeMs / frameTime, 0, 1) * 100 : 0}%` }} /></div>
             </div>
+            {gpuTotalMs != null && (
+              <>
+                <div className="deck-meter-divider" />
+                <div className="deck-meter">
+                  <div className="deck-meter-row"><span>GPU Total</span><span>{gpuTotalMs.toFixed(2)} ms</span></div>
+                  <div className="deck-meter-track"><div className="deck-meter-fill is-gpu" style={{ width: `${clamp(gpuTotalMs / 16.67, 0, 1) * 100}%` }} /></div>
+                </div>
+                <div className="deck-meter">
+                  <div className="deck-meter-row"><span>GPU Advect</span><span>{(gpuAdvectMs ?? 0).toFixed(2)} ms</span></div>
+                  <div className="deck-meter-track"><div className="deck-meter-fill is-gpu" style={{ width: `${gpuTotalMs > 0 ? clamp((gpuAdvectMs ?? 0) / gpuTotalMs, 0, 1) * 100 : 0}%` }} /></div>
+                </div>
+                <div className="deck-meter">
+                  <div className="deck-meter-row"><span>GPU Jacobi</span><span>{(gpuJacobiMs ?? 0).toFixed(2)} ms</span></div>
+                  <div className="deck-meter-track"><div className="deck-meter-fill is-gpu" style={{ width: `${gpuTotalMs > 0 ? clamp((gpuJacobiMs ?? 0) / gpuTotalMs, 0, 1) * 100 : 0}%` }} /></div>
+                </div>
+                <div className="deck-meter">
+                  <div className="deck-meter-row"><span>GPU Raymarch</span><span>{(gpuRaymarchMs ?? 0).toFixed(2)} ms</span></div>
+                  <div className="deck-meter-track"><div className="deck-meter-fill is-gpu" style={{ width: `${gpuTotalMs > 0 ? clamp((gpuRaymarchMs ?? 0) / gpuTotalMs, 0, 1) * 100 : 0}%` }} /></div>
+                </div>
+                {avgRaySteps != null && (
+                  <div className="deck-meter">
+                    <div className="deck-meter-row"><span>Avg Steps/Ray</span><span>{avgRaySteps.toFixed(1)}</span></div>
+                    <div className="deck-meter-track"><div className="deck-meter-fill is-gpu" style={{ width: `${clamp(avgRaySteps / rayStepBudget, 0, 1) * 100}%` }} /></div>
+                  </div>
+                )}
+              </>
+            )}
           </div>
         </div>
       </aside>

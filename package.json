@@ -24,22 +24,40 @@
   },
   "scripts": {
     "dev": "vite",
+    "reload:full": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/full-reload.ps1 -Port 4173",
+    "reload:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/full-reload.ps1 -Port 4173 -StartServer",
+    "windows:update": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/open-windows-update.ps1",
+    "gpu:driver": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/open-gpu-driver.ps1",
+    "dxil:check": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-dxil.ps1",
+    "chrome:check": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-chrome.ps1",
+    "webgpu:fix": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/webgpu-fix.ps1",
     "typecheck": "npx tsc --noEmit",
     "build": "vite build",
     "preview": "vite preview",
     "test": "npx playwright test",
     "test:stability": "npx playwright test",
     "test:stability:update": "npx playwright test --update-snapshots",
-    "test:stability:report": "npx playwright show-report"
+    "test:stability:report": "npx playwright show-report",
+    "gpu:health": "npx playwright test tests/stability/gpu-health.spec.js && node scripts/gpu-health-summary.mjs",
+    "gpu:health:summary": "node scripts/gpu-health-summary.mjs",
+    "gpu:health:clear": "powershell -NoProfile -Command \"$env:CLEAR_SITE_DATA='1'; npx playwright test tests/stability/gpu-health.spec.js; node scripts/gpu-health-summary.mjs\"",
+    "gpu:health:headed": "npx playwright test --headed tests/stability/gpu-health.spec.js && node scripts/gpu-health-summary.mjs",
+    "gpu:health:clear:headed": "powershell -NoProfile -Command \"$env:CLEAR_SITE_DATA='1'; npx playwright test --headed tests/stability/gpu-health.spec.js; node scripts/gpu-health-summary.mjs\"",
+    "gpu:health:chrome": "powershell -NoProfile -Command \"$env:PLAYWRIGHT_CHANNEL='chrome'; npx playwright test --headed tests/stability/gpu-health.spec.js; node scripts/gpu-health-summary.mjs\"",
+    "gpu:health:edge": "powershell -NoProfile -Command \"$env:PLAYWRIGHT_CHANNEL='msedge'; npx playwright test --headed tests/stability/gpu-health.spec.js; node scripts/gpu-health-summary.mjs\"",
+    "reload:gpu": "pnpm -s reload:full && pnpm -s gpu:health:clear"
   },
   "dependencies": {
-    "three": "^0.183.1",
+    "lucide-react": "^0.562.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
-    "lucide-react": "^0.562.0"
+    "three": "^0.183.1"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/three": "^0.183.1",
     "@vitejs/plugin-react": "^5.0.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"

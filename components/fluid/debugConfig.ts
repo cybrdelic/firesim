@@ -12,6 +12,22 @@ export interface RuntimePerfCounters {
   worldMs: number;
   compositeMs: number;
   substeps: number;
+  // GPU timestamp-based timing (null if timestamp-query not supported)
+  gpuAdvectMs: number | null;
+  gpuDivergenceMs: number | null;
+  gpuJacobiMs: number | null;
+  gpuGradientMs: number | null;
+  gpuRaymarchMs: number | null;
+  gpuTotalMs: number | null;
+  // Task B: Average ray steps per pixel (null if not yet available)
+  avgRaySteps: number | null;
+  // Field-sampled diagnostics from simulation buffers (null until first sample completes)
+  fieldSampledVoxels: number | null;
+  fieldAvgTemp: number | null;
+  fieldPeakTemp: number | null;
+  fieldAvgSoot: number | null;
+  fieldDivL1: number | null;
+  fieldReactionFraction: number | null;
 }
 
 export interface QualityBudget {

@@ -4,11 +4,30 @@ type GPUShaderStageFlags = number;
 type GPUDeviceLostReason = 'destroyed' | 'unknown' | string;
 type GPULoadOp = 'load' | 'clear';
 type GPUStoreOp = 'store' | 'discard';
+type GPUFeatureName = 'timestamp-query' | string;
+type GPUTextureUsageFlags = number;
+type GPUMapModeFlags = number;
 
 interface GPUBufferUsageNamespace {
   COPY_DST: GPUBufferUsageFlags;
+  COPY_SRC: GPUBufferUsageFlags;
   STORAGE: GPUBufferUsageFlags;
   UNIFORM: GPUBufferUsageFlags;
+  MAP_READ: GPUBufferUsageFlags;
+  QUERY_RESOLVE: GPUBufferUsageFlags;
+}
+
+interface GPUTextureUsageNamespace {
+  COPY_SRC: GPUTextureUsageFlags;
+  COPY_DST: GPUTextureUsageFlags;
+  TEXTURE_BINDING: GPUTextureUsageFlags;
+  STORAGE_BINDING: GPUTextureUsageFlags;
+  RENDER_ATTACHMENT: GPUTextureUsageFlags;
+}
+
+interface GPUMapModeNamespace {
+  READ: GPUMapModeFlags;
+  WRITE: GPUMapModeFlags;
 }
 
 interface GPUShaderStageNamespace {
@@ -19,6 +38,8 @@ interface GPUShaderStageNamespace {
 
 declare const GPUBufferUsage: GPUBufferUsageNamespace;
 declare const GPUShaderStage: GPUShaderStageNamespace;
+declare const GPUTextureUsage: GPUTextureUsageNamespace;
+declare const GPUMapMode: GPUMapModeNamespace;
 
 interface Navigator {
   gpu: GPU;
@@ -37,7 +58,17 @@ interface GPUSupportedLimits {
 
 interface GPUAdapter {
   limits: GPUSupportedLimits;
-  requestDevice(): Promise<GPUDevice>;
+  features: GPUSupportedFeatures;
+  requestDevice(descriptor?: GPUDeviceDescriptor): Promise<GPUDevice>;
+}
+
+interface GPUSupportedFeatures {
+  has(feature: GPUFeatureName): boolean;
+}
+
+interface GPUDeviceDescriptor extends GPUObjectDescriptorBase {
+  requiredFeatures?: GPUFeatureName[];
+  requiredLimits?: Record<string, number>;
 }
 
 interface GPUDeviceLostInfo {
@@ -67,6 +98,7 @@ interface GPUQueue {
 interface GPUDevice extends EventTarget {
   queue: GPUQueue;
   lost: Promise<GPUDeviceLostInfo>;
+  features: GPUSupportedFeatures;
 
   createBindGroupLayout(descriptor: GPUBindGroupLayoutDescriptor): GPUBindGroupLayout;
   createPipelineLayout(descriptor: GPUPipelineLayoutDescriptor): GPUPipelineLayout;
@@ -76,6 +108,9 @@ interface GPUDevice extends EventTarget {
   createComputePipeline(descriptor: GPUComputePipelineDescriptor): GPUComputePipeline;
   createRenderPipeline(descriptor: GPURenderPipelineDescriptor): GPURenderPipeline;
   createCommandEncoder(): GPUCommandEncoder;
+  createQuerySet(descriptor: GPUQuerySetDescriptor): GPUQuerySet;
+  createTexture(descriptor: GPUTextureDescriptor): GPUTexture;
+  createSampler(descriptor?: GPUSamplerDescriptor): GPUSampler;
   destroy(): void;
 
   addEventListener(
@@ -99,7 +134,11 @@ interface GPUBufferDescriptor extends GPUObjectDescriptorBase {
   usage: GPUBufferUsageFlags;
 }
 
-interface GPUBuffer {}
+interface GPUBuffer {
+  mapAsync(mode: GPUMapModeFlags, offset?: number, size?: number): Promise<void>;
+  getMappedRange(offset?: number, size?: number): ArrayBuffer;
+  unmap(): void;
+}
 
 type GPUBufferBindingType = 'uniform' | 'storage' | 'read-only-storage';
 
@@ -111,6 +150,18 @@ interface GPUBindGroupLayoutEntry {
   binding: number;
   visibility: GPUShaderStageFlags;
   buffer?: GPUBufferBindingLayout;
+  texture?: GPUTextureBindingLayout;
+  sampler?: GPUSamplerBindingLayout;
+}
+
+interface GPUTextureBindingLayout {
+  sampleType?: 'float' | 'unfilterable-float' | 'depth' | 'sint' | 'uint';
+  viewDimension?: string;
+  multisampled?: boolean;
+}
+
+interface GPUSamplerBindingLayout {
+  type?: 'filtering' | 'non-filtering' | 'comparison';
 }
 
 interface GPUBindGroupLayoutDescriptor extends GPUObjectDescriptorBase {
@@ -191,6 +242,18 @@ interface GPUFragmentState extends GPUProgrammableStage {
 
 interface GPUColorTargetState {
   format: GPUTextureFormat;
+  blend?: GPUBlendState;
+}
+
+interface GPUBlendState {
+  color: GPUBlendComponent;
+  alpha: GPUBlendComponent;
+}
+
+interface GPUBlendComponent {
+  srcFactor?: string;
+  dstFactor?: string;
+  operation?: string;
 }
 
 interface GPUPrimitiveState {
@@ -202,9 +265,21 @@ interface GPUComputePipeline {}
 interface GPURenderPipeline {}
 
 interface GPUCommandEncoder {
-  beginComputePass(): GPUComputePassEncoder;
+  beginComputePass(descriptor?: GPUComputePassDescriptor): GPUComputePassEncoder;
   beginRenderPass(descriptor: GPURenderPassDescriptor): GPURenderPassEncoder;
+  copyBufferToBuffer(src: GPUBuffer, srcOffset: number, dst: GPUBuffer, dstOffset: number, size: number): void;
+  resolveQuerySet(querySet: GPUQuerySet, firstQuery: number, queryCount: number, destination: GPUBuffer, destinationOffset: number): void;
   finish(): GPUCommandBuffer;
+}
+
+interface GPUComputePassDescriptor {
+  timestampWrites?: GPUComputePassTimestampWrites;
+}
+
+interface GPUComputePassTimestampWrites {
+  querySet: GPUQuerySet;
+  beginningOfPassWriteIndex?: number;
+  endOfPassWriteIndex?: number;
 }
 
 interface GPUComputePassEncoder {
@@ -230,6 +305,13 @@ interface GPURenderPassColorAttachment {
 
 interface GPURenderPassDescriptor {
   colorAttachments: GPURenderPassColorAttachment[];
+  timestampWrites?: GPURenderPassTimestampWrites;
+}
+
+interface GPURenderPassTimestampWrites {
+  querySet: GPUQuerySet;
+  beginningOfPassWriteIndex?: number;
+  endOfPassWriteIndex?: number;
 }
 
 interface GPURenderPassEncoder {
@@ -243,6 +325,28 @@ interface GPUCommandBuffer {}
 
 interface GPUTexture {
   createView(): GPUTextureView;
+  destroy(): void;
+  width: number;
+  height: number;
+}
+
+interface GPUTextureDescriptor extends GPUObjectDescriptorBase {
+  size: number[] | [number, number, number];
+  format: GPUTextureFormat;
+  usage: GPUTextureUsageFlags;
+}
+
+interface GPUQuerySet {}
+
+interface GPUQuerySetDescriptor extends GPUObjectDescriptorBase {
+  type: 'timestamp' | 'occlusion';
+  count: number;
+}
+
+interface GPUSamplerDescriptor extends GPUObjectDescriptorBase {
+  magFilter?: 'nearest' | 'linear';
+  minFilter?: 'nearest' | 'linear';
+  mipmapFilter?: 'nearest' | 'linear';
 }
 
 interface GPUCanvasConfiguration {

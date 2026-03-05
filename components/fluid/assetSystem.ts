@@ -30,11 +30,14 @@ export interface CampfireLogPileLoadResult {
   textures?: THREE.Texture[];
   sideMaterial?: THREE.MeshPhysicalMaterial;
   capMaterial?: THREE.MeshPhysicalMaterial;
+  // Base dimensions of the normalized scanned log source (used for per-instance scaling).
+  normalizedLogBaseLength?: number;
+  normalizedLogBaseRadius?: number;
 }
 
 export interface AddCampfireLogPileOptions {
   scene: THREE.Scene;
-  transforms: Array<{ position: THREE.Vector3; rotation: THREE.Euler }>;
+  transforms: Array<{ position: THREE.Vector3; rotation: THREE.Euler; length?: number; radius?: number }>;
   addFallbackLogPile: (scene: THREE.Scene) => FallbackLogPileResult;
   normalizeLogSource: (source: THREE.Object3D) => void;
   applyFallbackLogMaterial: (root: THREE.Object3D) => void;
@@ -178,11 +181,37 @@ export const addCampfireLogPile = async ({
 
   normalizeLogSource(scanned.root);
   applyFallbackLogMaterial(scanned.root);
+
+  // After normalization, compute a base length/radius so each instance can be scaled
+  // to match the SDF descriptor transforms.
+  scanned.root.updateMatrixWorld(true);
+  const baseBox = new THREE.Box3().setFromObject(scanned.root);
+  const baseSize = baseBox.getSize(new THREE.Vector3());
+  const baseLength = Math.max(baseSize.y, 1e-4);
+  const baseRadius = Math.max(0.5 * Math.max(baseSize.x, baseSize.z), 1e-4);
+
   for (const transform of transforms) {
     const instance = scanned.root.clone(true);
+    // Scale each cloned log so the visible mesh matches the analytic capsule SDF.
+    // This prevents fire/wood boundary mismatches when occlusion uses the SDF.
+    if (typeof transform.length === 'number' && Number.isFinite(transform.length)) {
+      const sY = Math.max(1e-4, transform.length) / baseLength;
+      const sR = (typeof transform.radius === 'number' && Number.isFinite(transform.radius))
+        ? Math.max(1e-4, transform.radius) / baseRadius
+        : 1.0;
+      instance.scale.multiply(new THREE.Vector3(sR, sY, sR));
+    } else if (typeof transform.radius === 'number' && Number.isFinite(transform.radius)) {
+      const sR = Math.max(1e-4, transform.radius) / baseRadius;
+      instance.scale.multiply(new THREE.Vector3(sR, sR, sR));
+    }
     instance.position.copy(transform.position);
     instance.rotation.copy(transform.rotation);
     scene.add(instance);
   }
-  return { assetState: 'scanned_asset_ready', source: scanned.sourceUrl };
+  return {
+    assetState: 'scanned_asset_ready',
+    source: scanned.sourceUrl,
+    normalizedLogBaseLength: baseLength,
+    normalizedLogBaseRadius: baseRadius,
+  };
 };
