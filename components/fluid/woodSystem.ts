@@ -59,7 +59,7 @@ export interface WoodCombustionRuntime {
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
-export const WOOD_PILE_DESCRIPTOR: WoodPileDescriptor = {
+const WOOD_PILE_DESCRIPTOR_RAW: WoodPileDescriptor = {
   logs: [
     {
       id: 'log-a',
@@ -116,6 +116,29 @@ export const getWoodSegmentsFromDescriptor = (descriptor: WoodPileDescriptor): W
     };
   })
 );
+
+export const computeWoodPileFloorSnap = (descriptor: WoodPileDescriptor, floorY = 0.0) => {
+  const segments = getWoodSegmentsFromDescriptor(descriptor);
+  let minY = Number.POSITIVE_INFINITY;
+  for (const seg of segments) {
+    minY = Math.min(minY, seg.start[1] - seg.radius, seg.end[1] - seg.radius);
+  }
+  const offsetY = Number.isFinite(minY) ? (floorY - minY) : 0.0;
+  return { offsetY, minY };
+};
+
+export const snapWoodPileToFloor = (descriptor: WoodPileDescriptor, floorY = 0.0): WoodPileDescriptor => {
+  const { offsetY } = computeWoodPileFloorSnap(descriptor, floorY);
+  if (!offsetY) return descriptor;
+  return {
+    logs: descriptor.logs.map((log) => ({
+      ...log,
+      position: [log.position[0], log.position[1] + offsetY, log.position[2]],
+    })),
+  };
+};
+
+export const WOOD_PILE_DESCRIPTOR: WoodPileDescriptor = snapWoodPileToFloor(WOOD_PILE_DESCRIPTOR_RAW, 0.0);
 
 const wgslFloat = (value: number) => Number(value).toFixed(4);
 

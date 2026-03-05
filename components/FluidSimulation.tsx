@@ -44,6 +44,7 @@ import {
 import { startFireVolumeSystem, type UniformUpdateInput } from './fluid/fireVolumeSystem';
 import {
     buildWoodSdfWgsl,
+  computeWoodPileFloorSnap,
     createWoodBurnStateById,
     getWoodLogTransforms,
     updateWoodCombustionSystem,
@@ -3434,6 +3435,7 @@ const FluidSimulation: React.FC = () => {
 
       const textures: THREE.Texture[] = [];
       addWorldProps(scene);
+      const woodFloor = computeWoodPileFloorSnap(WOOD_PILE_DESCRIPTOR, 0.0);
       const logAsset = await addCampfireLogPile({
         scene,
         transforms: getWoodLogTransforms(WOOD_PILE_DESCRIPTOR),
@@ -3445,17 +3447,17 @@ const FluidSimulation: React.FC = () => {
       if (logAsset.assetState === 'scanned_asset_ready') {
         pushTimeline(`AssetSystem ${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} (${logAsset.source})`);
         appendRuntimeLog(
-          `world: woodAssetState=${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} source=${logAsset.source ?? '-'} baseLen=${(logAsset.normalizedLogBaseLength ?? 0).toFixed(4)} baseRad=${(logAsset.normalizedLogBaseRadius ?? 0).toFixed(4)} note=scanned_instances_scaled_to_descriptor`
+          `world: woodAssetState=${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} source=${logAsset.source ?? '-'} baseLen=${(logAsset.normalizedLogBaseLength ?? 0).toFixed(4)} baseRad=${(logAsset.normalizedLogBaseRadius ?? 0).toFixed(4)} woodMinY=${(woodFloor.minY ?? 0).toFixed(4)} note=scanned_instances_scaled_to_descriptor`
         );
       } else if (logAsset.assetState === 'procedural_fallback') {
         pushTimeline(`AssetSystem ${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} (${logAsset.reason ?? 'fallback'})`);
         appendRuntimeLog(
-          `world: woodAssetState=${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} reason=${logAsset.reason ?? 'fallback'} note=procedural_capsule_mesh_matches_sdf_descriptor`
+          `world: woodAssetState=${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} reason=${logAsset.reason ?? 'fallback'} woodMinY=${(woodFloor.minY ?? 0).toFixed(4)} note=procedural_capsule_mesh_matches_sdf_descriptor`
         );
       } else {
         pushTimeline(`AssetSystem ${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} (${logAsset.reason ?? 'no_asset'})`);
         appendRuntimeLog(
-          `world: woodAssetState=${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} reason=${logAsset.reason ?? 'no_asset'}`
+          `world: woodAssetState=${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} reason=${logAsset.reason ?? 'no_asset'} woodMinY=${(woodFloor.minY ?? 0).toFixed(4)}`
         );
       }
       const logCharSideColor = new THREE.Color(0x18110d);
