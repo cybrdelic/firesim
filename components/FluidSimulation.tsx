@@ -1420,10 +1420,13 @@ fn phase_function(costheta: f32, g: f32) -> f32 {
 // Task 14: Calibrated blackbody ramp - reduced peak to prevent blowout
 fn getBlackbodyColor(temp: f32) -> vec3f {
    let t = max(0.0, temp - 0.12);
-   if (t < 0.3) { return mix(vec3f(0.0), vec3f(2.0, 0.04, 0.001), t / 0.3); }
-   else if (t < 0.75) { return mix(vec3f(2.0, 0.04, 0.001), vec3f(5.0, 1.6, 0.08), (t - 0.3) / 0.45); }
-   else if (t < 1.4) { return mix(vec3f(5.0, 1.6, 0.08), vec3f(10.0, 7.0, 1.0), (t - 0.75) / 0.65); }
-   else { return mix(vec3f(10.0, 7.0, 1.0), vec3f(18.0, 16.0, 12.0), clamp((t - 1.4) * 0.4, 0.0, 1.0)); }
+   if (t < 0.3) { return mix(vec3f(0.0), vec3f(1.8, 0.04, 0.001), t / 0.3); }
+   else if (t < 0.75) { return mix(vec3f(1.8, 0.04, 0.001), vec3f(4.8, 1.35, 0.08), (t - 0.3) / 0.45); }
+   else if (t < 1.25) { return mix(vec3f(4.8, 1.35, 0.08), vec3f(8.6, 5.4, 0.7), (t - 0.75) / 0.5); }
+   else {
+     let hot = clamp((t - 1.25) * 0.5, 0.0, 1.0);
+     return mix(vec3f(8.6, 5.4, 0.7), vec3f(11.4, 8.6, 5.0), hot);
+   }
 }
 
 fn get_light_transmittance(pos: vec3f, lightDir: vec3f) -> f32 {
@@ -1685,18 +1688,25 @@ fn intersect_occluders(ro: vec3f, rd: vec3f, minT: f32, maxT: f32, useSdfOcclude
         let sunTrans = cachedSunTrans;
         let sootTint = vec3f(0.10, 0.09, 0.085);
         let hazeTint = vec3f(0.18, 0.18, 0.19);
+        let warmHazeTint = vec3f(0.28, 0.20, 0.14);
         let sootFrac = clamp(sootOpt / max(1e-6, sootOpt + hazeOpt), 0.0, 1.0);
-        let smokeTint = mix(hazeTint, sootTint, sootFrac);
-        let scatterRadiance = vec3f(9.0) * sunTrans * phaseSun * smokeTint;
+        let hazeMix = clamp(hot * (1.0 - sootFrac) * 0.55, 0.0, 0.55);
+        let smokeTint = mix(mix(hazeTint, warmHazeTint, hazeMix), sootTint, sootFrac);
+        let shadowTr = max(0.35, mix(1.0, sunTrans, 0.35));
+        let skyScatter = vec3f(8.0) * sunTrans * phaseSun * smokeTint;
+        let fireScatterColor = mix(vec3f(0.95, 0.34, 0.08), vec3f(1.0, 0.62, 0.24), hot);
+        let fireScatterStrength = params.lightingGlow * shadowTr * (0.05 + reaction * 0.52 + hazeOpt * 0.12);
+        let scatterRadiance = skyScatter + fireScatterColor * fireScatterStrength;
         let scatterWeight = (sigmaS / max(1e-6, sigmaT)) * (1.0 - stepTrans);
         accumCol += scatterRadiance * scatterWeight * transmittance;
 
         // Flame-only emission: reaction emits, soot only attenuates.
         // Apply a *soft* self-shadow (don't zero out emission inside smoke).
-        let shadowTr = max(0.35, mix(1.0, sunTrans, 0.35));
         let microFlame = clamp(1.0 + detail * 0.18, 0.7, 1.3);
-        let reactionEm = reaction * reaction;
-        let emission = getBlackbodyColor(temp) * params.emission * reactionEm * shadowTr * microFlame;
+        let reactionEm = pow(clamp(reaction, 0.0, 1.0), 1.55);
+        let coreCompression = 1.0 / (1.0 + max(0.0, temp - 1.05) * 0.55 + reaction * 0.22);
+        let hotCoreTint = mix(vec3f(1.0), vec3f(1.0, 0.93, 0.78), smoothstep(1.0, 1.6, temp));
+        let emission = getBlackbodyColor(temp) * hotCoreTint * params.emission * reactionEm * shadowTr * microFlame * coreCompression;
         let emissionIntegral = emission * ((1.0 - stepTrans) / max(1e-4, sigmaT));
         accumCol += emissionIntegral * transmittance;
 
@@ -2304,6 +2314,7 @@ interface WorldRuntime {
   keyLight: THREE.DirectionalLight;
   fillLight: THREE.HemisphereLight;
   fireLight: THREE.PointLight;
+  fireBounceLight: THREE.PointLight;
   textures: THREE.Texture[];
   logSideMaterial?: THREE.MeshPhysicalMaterial;
   logCapMaterial?: THREE.MeshPhysicalMaterial;
@@ -3393,6 +3404,22 @@ const FluidSimulation: React.FC = () => {
       const skyDay = new THREE.Color(0x9eb6cc);
       const skyNight = new THREE.Color(0x111a25);
       const skyMix = new THREE.Color();
+      const floorBaseColor = new THREE.Color(0x868b90);
+      const floorWarmColor = new THREE.Color(0x9a765d);
+      const floorHotColor = new THREE.Color(0xc58b5e);
+      const wallBaseColor = new THREE.Color(0x434950);
+      const wallWarmColor = new THREE.Color(0x6d564b);
+      const wallHotColor = new THREE.Color(0x9a6d52);
+      const emberLightColor = new THREE.Color(0xff641f);
+      const flameLightColor = new THREE.Color(0xffa34d);
+      const coreLightColor = new THREE.Color(0xfff0c0);
+      const fillSkyBase = new THREE.Color(0x9fbfe0);
+      const fillGroundBase = new THREE.Color(0x2a3038);
+      const fillGroundWarm = new THREE.Color(0x40251a);
+      const fireColor = new THREE.Color();
+      const bounceColor = new THREE.Color();
+      const floorTint = new THREE.Color();
+      const wallTint = new THREE.Color();
       scene.background = skyDay.clone();
       scene.fog = new THREE.Fog(0x9eb6cc, 3.5, 26.0);
 
@@ -3416,14 +3443,21 @@ const FluidSimulation: React.FC = () => {
       fireLight.castShadow = false;
       scene.add(fireLight);
 
+      const fireBounceLight = new THREE.PointLight(0xff6926, 1.2, 4.4, 2.0);
+      fireBounceLight.position.set(0.5, 0.08, 0.08);
+      fireBounceLight.castShadow = false;
+      scene.add(fireBounceLight);
+
       const floorGeometry = new THREE.PlaneGeometry(34, 34);
       floorGeometry.rotateX(-Math.PI / 2);
       const floorMaterial = new THREE.MeshPhysicalMaterial({
-        color: 0x868b90,
+        color: floorBaseColor,
         roughness: 0.76,
         metalness: 0.06,
         clearcoat: 0.12,
         clearcoatRoughness: 0.44,
+        emissive: 0x120803,
+        emissiveIntensity: 0.0,
       });
       const floorMesh = new THREE.Mesh(floorGeometry, floorMaterial);
       floorMesh.position.set(0.5, 0.0, 0.5);
@@ -3432,9 +3466,11 @@ const FluidSimulation: React.FC = () => {
       scene.add(floorMesh);
 
       const wallMaterial = new THREE.MeshPhysicalMaterial({
-        color: 0x434950,
+        color: wallBaseColor,
         roughness: 0.78,
         metalness: 0.03,
+        emissive: 0x0d0502,
+        emissiveIntensity: 0.0,
       });
       const wall = new THREE.Mesh(new THREE.PlaneGeometry(24, 8), wallMaterial);
       wall.position.set(0.5, 3.25, -3.4);
@@ -3514,6 +3550,7 @@ const FluidSimulation: React.FC = () => {
         keyLight,
         fillLight,
         fireLight,
+        fireBounceLight,
         textures,
         logSideMaterial: logAsset.sideMaterial,
         logCapMaterial: logAsset.capMaterial,
@@ -3550,30 +3587,67 @@ const FluidSimulation: React.FC = () => {
 
         const p = paramsRef.current;
         const dayBlend = clamp(1.0 - p.lightingFlicker, 0.0, 1.0);
+        const fireTime = worldStartMs * 0.001;
+        const flickerBand =
+          Math.sin(fireTime * 6.7) * 0.5 +
+          Math.sin(fireTime * 12.9 + 0.7) * 0.32 +
+          Math.sin(fireTime * 19.7 + 2.1) * 0.18;
+        const flicker = 1.0 + flickerBand * clamp(0.03 + p.lightingFlicker * 0.08, 0.03, 0.11);
+        const fireEnergy = clamp(0.26 + p.emission * 0.09 + p.fuelEfficiency * 0.15 + p.buoyancy * 0.06, 0.4, 1.85);
+        const smokeLoad = clamp((1.0 - p.smokeDissipation) * 40.0 + Math.max(0.0, p.smokeWeight) * 0.04 + p.smokeDarkness * 0.45, 0.0, 1.35);
+        const fireHeat = clamp(fireEnergy * flicker, 0.3, 2.2);
+        const glowReach = clamp(0.4 + p.lightingGlow * 0.35 + p.lightingFireFalloff * 0.18, 0.35, 1.85);
+        const floorBounce = clamp(fireHeat * (0.22 + p.floorFireBounce * 0.28), 0.0, 1.8);
+        const wallBounce = clamp(fireHeat * glowReach * (0.14 + p.lightingFireIntensity * 0.12) - smokeLoad * 0.05, 0.0, 1.4);
+        fireColor.copy(emberLightColor)
+          .lerp(flameLightColor, clamp(0.34 + fireHeat * 0.34, 0.0, 1.0))
+          .lerp(coreLightColor, clamp((fireHeat - 0.85) * 0.45, 0.0, 0.42));
+        bounceColor.copy(emberLightColor)
+          .lerp(flameLightColor, clamp(0.18 + floorBounce * 0.26, 0.0, 0.72));
         skyMix.copy(skyNight).lerp(skyDay, dayBlend);
         runtime.scene.background = skyMix;
         (runtime.scene.fog as THREE.Fog).color.copy(skyMix);
         runtime.renderer.toneMappingExposure = clamp(p.exposure * 0.95, 0.45, 1.8);
 
-        runtime.keyLight.intensity = clamp(0.9 + p.floorAmbient * 1.8, 0.55, 3.4);
-        runtime.fillLight.intensity = clamp(0.22 + p.floorAmbient * 1.0, 0.12, 1.5);
+        runtime.keyLight.intensity = clamp(0.85 + p.floorAmbient * 1.55 - floorBounce * 0.08, 0.5, 3.2);
+        runtime.fillLight.intensity = clamp(0.18 + p.floorAmbient * 0.82 + floorBounce * 0.06, 0.1, 1.6);
+        runtime.fillLight.color.copy(fillSkyBase).lerp(fireColor, clamp(floorBounce * 0.04, 0.0, 0.14));
+        runtime.fillLight.groundColor.copy(fillGroundBase).lerp(fillGroundWarm, clamp(floorBounce * 0.18, 0.0, 0.52));
 
         runtime.fireLight.position.set(0.5, 0.22 + p.volumeHeight * 0.12, 0.5);
-        runtime.fireLight.intensity = clamp(0.65 + p.lightingFireIntensity * 0.30 + p.emission * 0.08, 0.4, 8.0);
-        runtime.fireLight.distance = clamp(1.6 + p.lightingFireFalloff * 1.8, 1.2, 8.8);
+        runtime.fireLight.color.copy(fireColor);
+        runtime.fireLight.intensity = clamp(0.45 + fireHeat * (0.9 + p.lightingFireIntensity * 0.95), 0.25, 9.5);
+        runtime.fireLight.distance = clamp(1.8 + p.lightingFireFalloff * 1.4 + glowReach * 1.6, 1.3, 9.5);
+        runtime.fireBounceLight.position.set(0.5, 0.08, 0.08);
+        runtime.fireBounceLight.color.copy(bounceColor);
+        runtime.fireBounceLight.intensity = clamp(0.05 + floorBounce * 1.05, 0.0, 5.2);
+        runtime.fireBounceLight.distance = clamp(1.3 + p.lightingFireFalloff * 1.05 + p.floorFireBounce * 0.7, 1.1, 6.8);
+
+        floorTint.copy(floorBaseColor)
+          .lerp(floorWarmColor, clamp(floorBounce * 0.18, 0.0, 0.34))
+          .lerp(floorHotColor, clamp((floorBounce - 0.55) * 0.12, 0.0, 0.22));
+        runtime.floorMaterial.color.copy(floorTint);
+        runtime.floorMaterial.emissive.copy(bounceColor);
+        runtime.floorMaterial.emissiveIntensity = clamp(floorBounce * 0.08, 0.0, 0.22);
 
         runtime.floorMaterial.roughness = clamp(
-          0.22 + (1.0 - p.floorSpecular) * 0.58 + p.floorSootRoughness * 0.08,
+          0.22 + (1.0 - p.floorSpecular) * 0.58 + p.floorSootRoughness * 0.08 - floorBounce * 0.05,
           0.12,
           0.98
         );
-        runtime.floorMaterial.metalness = clamp(0.01 + p.floorSpecular * 0.24, 0.0, 0.4);
-        runtime.floorMaterial.clearcoat = clamp(0.05 + p.floorSpecular * 0.36, 0.0, 0.82);
-        runtime.floorMaterial.clearcoatRoughness = clamp(0.82 - p.floorSpecular * 0.68, 0.1, 0.95);
-        runtime.floorMaterial.envMapIntensity = clamp(0.6 + p.floorSpecular * 1.2, 0.2, 2.8);
+        runtime.floorMaterial.metalness = clamp(0.01 + p.floorSpecular * 0.22, 0.0, 0.4);
+        runtime.floorMaterial.clearcoat = clamp(0.05 + p.floorSpecular * 0.34 + floorBounce * 0.05, 0.0, 0.82);
+        runtime.floorMaterial.clearcoatRoughness = clamp(0.82 - p.floorSpecular * 0.66 - floorBounce * 0.04, 0.1, 0.95);
+        runtime.floorMaterial.envMapIntensity = clamp(0.55 + p.floorSpecular * 1.05 + floorBounce * 0.36, 0.2, 2.8);
 
-        runtime.wallMaterial.roughness = clamp(0.62 + p.smokeDarkness * 0.35, 0.45, 0.98);
-        runtime.wallMaterial.metalness = clamp(0.02 + p.floorSpecular * 0.08, 0.0, 0.18);
+        wallTint.copy(wallBaseColor)
+          .lerp(wallWarmColor, clamp(wallBounce * 0.2, 0.0, 0.28))
+          .lerp(wallHotColor, clamp((wallBounce - 0.4) * 0.12, 0.0, 0.18));
+        runtime.wallMaterial.color.copy(wallTint);
+        runtime.wallMaterial.emissive.copy(fireColor);
+        runtime.wallMaterial.emissiveIntensity = clamp(wallBounce * 0.09, 0.0, 0.2);
+        runtime.wallMaterial.roughness = clamp(0.58 + p.smokeDarkness * 0.28 - wallBounce * 0.04, 0.42, 0.96);
+        runtime.wallMaterial.metalness = clamp(0.02 + p.floorSpecular * 0.05, 0.0, 0.16);
 
         updateWoodCombustionSystem(runtime, p, sceneRef.current, logCharSideColor, logCharCapColor);
 
