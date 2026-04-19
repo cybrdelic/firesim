@@ -44,8 +44,8 @@ export const QUALITY_BUDGETS: Record<QualityMode, QualityBudget> = {
   },
   accurate: {
     frameBudgetMs: 33.3,
-    rayStepBudget: 220,
-    occlusionStepBudget: 90,
+    rayStepBudget: 180,
+    occlusionStepBudget: 64,
   },
 };
 
@@ -70,8 +70,8 @@ export const COMPOSITION_MODE_LABELS: Record<CompositionDebugMode, string> = {
 };
 
 export const FIRE_OCCLUSION_LABELS: Record<FireOcclusionMode, string> = {
-  depth_coupled: 'Depth Coupled',
-  analytic_sdf: 'Analytic SDF',
+  depth_coupled: 'Approx Depth',
+  analytic_sdf: 'World SDF',
   none: 'No Occlusion',
 };
 

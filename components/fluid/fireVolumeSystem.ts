@@ -294,6 +294,7 @@ export const startFireVolumeSystem = <TTransport extends FireVolumeTransport, TP
       });
       let stepReadPending = false;
       let lastAvgSteps: number | null = null;
+      let lastRenderPixelCount = 0;
       const zeroU32 = new Uint32Array([0]);
 
       let simFrame = 0;
@@ -309,6 +310,7 @@ export const startFireVolumeSystem = <TTransport extends FireVolumeTransport, TP
       let compositeAccumMs = 0;
       let substepsAccum = 0;
       let lastBudgetWarning = '';
+      let lastWorldRenderAtMs = Number.NEGATIVE_INFINITY;
 
       // Logging can be surprisingly expensive (string churn -> GC spikes).
       // Keep it informative but throttled so it doesn't become the bottleneck.
@@ -338,8 +340,9 @@ export const startFireVolumeSystem = <TTransport extends FireVolumeTransport, TP
         statsTimer += dt;
         const shouldAdvance = refs.playingRef.current || refs.stepFramesRef.current > 0;
         const activeQuality = refs.qualityModeRef.current;
+        const useHalfResFirePass = activeQuality === 'realtime';
         const budget = QUALITY_BUDGETS[activeQuality];
-        const qualityBoost = activeQuality === 'accurate' ? 1.5 : 1.0;
+        const qualityBoost = activeQuality === 'accurate' ? 1.15 : 1.0;
         const adaptiveScale = activeQuality === 'accurate' ? 1.0 : refs.adaptiveStepScaleRef.current;
         const stepQuality = clamp(refs.paramsRef.current.stepQuality * qualityBoost * adaptiveScale, 0.25, 4.0);
         const rayStepBudget = Math.max(24, Math.round(budget.rayStepBudget * (activeQuality === 'accurate' ? 1.0 : adaptiveScale)));
@@ -355,7 +358,7 @@ export const startFireVolumeSystem = <TTransport extends FireVolumeTransport, TP
         // actually hit the frame budget on slower GPUs / larger grids.
         const jacobiIterations =
           activeQuality === 'accurate'
-            ? 12
+            ? (transport.dim >= 192 ? 8 : 10)
             : activeQuality === 'realtime'
               ? clamp(Math.round(6 * adaptiveScale), 2, 6)
               : 6;
@@ -518,160 +521,172 @@ export const startFireVolumeSystem = <TTransport extends FireVolumeTransport, TP
         // Task B: Reset ray step counter before render
         device.queue.writeBuffer(transport.rayStepCounter, 0, zeroU32);
 
-        // Task D: Ensure half-res texture matches canvas size
         const canvasTex = context.getCurrentTexture();
         const cw = canvasTex.width;
         const ch = canvasTex.height;
-        const needW = Math.max(1, Math.ceil(cw / 2));
-        const needH = Math.max(1, Math.ceil(ch / 2));
-        if (needW !== halfResW || needH !== halfResH) {
-          log(`resize: halfRes ${halfResW}x${halfResH} -> ${needW}x${needH}`);
-          halfResTexture?.destroy();
-          historyTexA?.destroy();
-          historyTexB?.destroy();
-          halfResW = needW;
-          halfResH = needH;
-          const texDesc = {
-            size: [halfResW, halfResH, 1] as [number, number, number],
-            format,
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-          };
-          halfResTexture = device.createTexture({ ...texDesc, label: 'HalfResVolume' });
-          historyTexA = device.createTexture({ ...texDesc, label: 'HistoryA' });
-          historyTexB = device.createTexture({ ...texDesc, label: 'HistoryB' });
-          halfResView = halfResTexture.createView();
-          historyViewA = historyTexA.createView();
-          historyViewB = historyTexB.createView();
+        if (useHalfResFirePass) {
+          const needW = Math.max(1, Math.ceil(cw / 2));
+          const needH = Math.max(1, Math.ceil(ch / 2));
+          if (needW !== halfResW || needH !== halfResH) {
+            log(`resize: halfRes ${halfResW}x${halfResH} -> ${needW}x${needH}`);
+            halfResTexture?.destroy();
+            historyTexA?.destroy();
+            historyTexB?.destroy();
+            halfResW = needW;
+            halfResH = needH;
+            const texDesc = {
+              size: [halfResW, halfResH, 1] as [number, number, number],
+              format,
+              usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+            };
+            halfResTexture = device.createTexture({ ...texDesc, label: 'HalfResVolume' });
+            historyTexA = device.createTexture({ ...texDesc, label: 'HistoryA' });
+            historyTexB = device.createTexture({ ...texDesc, label: 'HistoryB' });
+            halfResView = halfResTexture.createView();
+            historyViewA = historyTexA.createView();
+            historyViewB = historyTexB.createView();
 
-          // Cache upsample bind groups (avoid per-frame bind group creation).
-          upsampleBindGroupA = device.createBindGroup({
-            layout: upsampleBindGroupLayout,
-            entries: [
-              { binding: 0, resource: historyViewA },
-              { binding: 1, resource: upsampleSampler },
-            ],
-            label: 'Upsample_BG_A',
-          });
-          upsampleBindGroupB = device.createBindGroup({
-            layout: upsampleBindGroupLayout,
-            entries: [
-              { binding: 0, resource: historyViewB },
-              { binding: 1, resource: upsampleSampler },
-            ],
-            label: 'Upsample_BG_B',
-          });
+            upsampleBindGroupA = device.createBindGroup({
+              layout: upsampleBindGroupLayout,
+              entries: [
+                { binding: 0, resource: historyViewA },
+                { binding: 1, resource: upsampleSampler },
+              ],
+              label: 'Upsample_BG_A',
+            });
+            upsampleBindGroupB = device.createBindGroup({
+              layout: upsampleBindGroupLayout,
+              entries: [
+                { binding: 0, resource: historyViewB },
+                { binding: 1, resource: upsampleSampler },
+              ],
+              label: 'Upsample_BG_B',
+            });
 
-          // Bind group for initializing history from the newly rendered half-res frame.
-          halfResToHistoryBindGroup = device.createBindGroup({
-            layout: upsampleBindGroupLayout,
-            entries: [
-              { binding: 0, resource: halfResView },
-              { binding: 1, resource: upsampleSampler },
-            ],
-            label: 'HalfResToHistory_BG',
-          });
+            halfResToHistoryBindGroup = device.createBindGroup({
+              layout: upsampleBindGroupLayout,
+              entries: [
+                { binding: 0, resource: halfResView },
+                { binding: 1, resource: upsampleSampler },
+              ],
+              label: 'HalfResToHistory_BG',
+            });
 
-          // Temporal blend group A: reads halfRes + historyA → (render target will be historyB)
-          temporalBlendGroupA = device.createBindGroup({
-            layout: temporalBlendBGL,
-            entries: [
-              { binding: 0, resource: halfResView },
-              { binding: 1, resource: historyViewA },
-              { binding: 2, resource: upsampleSampler },
-            ],
-            label: 'TemporalBlend_A',
+            temporalBlendGroupA = device.createBindGroup({
+              layout: temporalBlendBGL,
+              entries: [
+                { binding: 0, resource: halfResView },
+                { binding: 1, resource: historyViewA },
+                { binding: 2, resource: upsampleSampler },
+              ],
+              label: 'TemporalBlend_A',
+            });
+            temporalBlendGroupB = device.createBindGroup({
+              layout: temporalBlendBGL,
+              entries: [
+                { binding: 0, resource: halfResView },
+                { binding: 1, resource: historyViewB },
+                { binding: 2, resource: upsampleSampler },
+              ],
+              label: 'TemporalBlend_B',
+            });
+            historyPing = 0;
+            historyValid = false;
+          }
+
+          lastRenderPixelCount = needW * needH;
+
+          const rp = enc.beginRenderPass({
+            colorAttachments: [{
+              view: halfResView!,
+              clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+              loadOp: 'clear',
+              storeOp: 'store',
+            }],
+            ...(supportsTimestamp && querySet ? {
+              timestampWrites: { querySet, beginningOfPassWriteIndex: 8, endOfPassWriteIndex: 9 },
+            } : {}),
           });
-          // Temporal blend group B: reads halfRes + historyB → (render target will be historyA)
-          temporalBlendGroupB = device.createBindGroup({
-            layout: temporalBlendBGL,
-            entries: [
-              { binding: 0, resource: halfResView },
-              { binding: 1, resource: historyViewB },
-              { binding: 2, resource: upsampleSampler },
-            ],
-            label: 'TemporalBlend_B',
+          if (refs.compositionModeRef.current !== 'world_only') {
+            rp.setPipeline(renderPipeline);
+            rp.setBindGroup(0, transport.renderGroups[activeRenderGroup]);
+            rp.draw(6);
+          }
+          rp.end();
+
+          if (!historyValid && refs.compositionModeRef.current !== 'world_only') {
+            const initHistoryPass = enc.beginRenderPass({
+              colorAttachments: [{
+                view: historyViewA!,
+                clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+                loadOp: 'clear',
+                storeOp: 'store',
+              }],
+            });
+            initHistoryPass.setPipeline(upsamplePipeline);
+            initHistoryPass.setBindGroup(0, halfResToHistoryBindGroup!);
+            initHistoryPass.draw(6);
+            initHistoryPass.end();
+            historyValid = true;
+          }
+
+          const writeToB = historyPing === 0;
+          const blendTarget = writeToB ? historyViewB! : historyViewA!;
+          const blendGroup = writeToB ? temporalBlendGroupA : temporalBlendGroupB;
+          if (refs.compositionModeRef.current !== 'world_only' && blendGroup) {
+            const tbPass = enc.beginRenderPass({
+              colorAttachments: [{
+                view: blendTarget,
+                clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+                loadOp: 'clear',
+                storeOp: 'store',
+              }],
+            });
+            tbPass.setPipeline(temporalBlendPipeline);
+            tbPass.setBindGroup(0, blendGroup);
+            tbPass.draw(6);
+            tbPass.end();
+          }
+
+          const upsampleBindGroup = writeToB ? upsampleBindGroupB : upsampleBindGroupA;
+          historyPing = 1 - historyPing;
+
+          const upPass = enc.beginRenderPass({
+            colorAttachments: [{
+              view: canvasTex.createView(),
+              clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+              loadOp: 'clear',
+              storeOp: 'store',
+            }],
           });
-          // Upsample reads from whichever history was just written
-          // We'll select A/B prebuilt bind groups each frame.
-          historyPing = 0;
+          if (refs.compositionModeRef.current !== 'world_only' && upsampleBindGroup) {
+            upPass.setPipeline(upsamplePipeline);
+            upPass.setBindGroup(0, upsampleBindGroup);
+            upPass.draw(6);
+          }
+          upPass.end();
+        } else {
+          lastRenderPixelCount = cw * ch;
           historyValid = false;
-        }
 
-        // Pass 1: Render volume at half resolution
-        const rp = enc.beginRenderPass({
-          colorAttachments: [{
-            view: halfResView!,
-            clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
-            loadOp: 'clear',
-            storeOp: 'store',
-          }],
-          ...(supportsTimestamp && querySet ? {
-            timestampWrites: { querySet, beginningOfPassWriteIndex: 8, endOfPassWriteIndex: 9 },
-          } : {}),
-        });
-        if (refs.compositionModeRef.current !== 'world_only') {
-          rp.setPipeline(renderPipeline);
-          rp.setBindGroup(0, transport.renderGroups[activeRenderGroup]);
-          rp.draw(6);
-        }
-        rp.end();
-
-        // Initialize temporal history deterministically after resize/creation.
-        // Without this, Pass 2 would sample undefined texture contents.
-        if (!historyValid && refs.compositionModeRef.current !== 'world_only') {
-          const initHistoryPass = enc.beginRenderPass({
+          const rp = enc.beginRenderPass({
             colorAttachments: [{
-              view: historyViewA!,
+              view: canvasTex.createView(),
               clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
               loadOp: 'clear',
               storeOp: 'store',
             }],
+            ...(supportsTimestamp && querySet ? {
+              timestampWrites: { querySet, beginningOfPassWriteIndex: 8, endOfPassWriteIndex: 9 },
+            } : {}),
           });
-          initHistoryPass.setPipeline(upsamplePipeline);
-          initHistoryPass.setBindGroup(0, halfResToHistoryBindGroup!);
-          initHistoryPass.draw(6);
-          initHistoryPass.end();
-          historyValid = true;
+          if (refs.compositionModeRef.current !== 'world_only') {
+            rp.setPipeline(renderPipeline);
+            rp.setBindGroup(0, transport.renderGroups[activeRenderGroup]);
+            rp.draw(6);
+          }
+          rp.end();
         }
-
-        // Pass 2: Temporal blend at half-res (reads current + history[prev] → writes history[curr])
-        const writeToB = historyPing === 0;
-        const blendTarget = writeToB ? historyViewB! : historyViewA!;
-        const blendGroup = writeToB ? temporalBlendGroupA : temporalBlendGroupB;
-        if (refs.compositionModeRef.current !== 'world_only' && blendGroup) {
-          const tbPass = enc.beginRenderPass({
-            colorAttachments: [{
-              view: blendTarget,
-              clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
-              loadOp: 'clear',
-              storeOp: 'store',
-            }],
-          });
-          tbPass.setPipeline(temporalBlendPipeline);
-          tbPass.setBindGroup(0, blendGroup);
-          tbPass.draw(6);
-          tbPass.end();
-        }
-
-        // Select cached upsample bind group to read from the just-written history.
-        const upsampleBindGroup = writeToB ? upsampleBindGroupB : upsampleBindGroupA;
-        historyPing = 1 - historyPing;
-
-        // Pass 3: Bilateral upsample from temporally-blended half-res to full canvas
-        const upPass = enc.beginRenderPass({
-          colorAttachments: [{
-            view: canvasTex.createView(),
-            clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
-            loadOp: 'clear',
-            storeOp: 'store',
-          }],
-        });
-        if (refs.compositionModeRef.current !== 'world_only' && upsampleBindGroup) {
-          upPass.setPipeline(upsamplePipeline);
-          upPass.setBindGroup(0, upsampleBindGroup);
-          upPass.draw(6);
-        }
-        upPass.end();
 
         // Readback copies: only copy into a readback buffer when it's not mapped / pending map,
         // and at a throttled cadence to reduce driver stalls / jitter.
@@ -730,7 +745,7 @@ export const startFireVolumeSystem = <TTransport extends FireVolumeTransport, TP
           stepReadBuffer.mapAsync(GPUMapMode.READ).then(() => {
             const data = new Uint32Array(stepReadBuffer.getMappedRange());
             const totalSteps = data[0];
-            const pixelCount = halfResW * halfResH;
+            const pixelCount = Math.max(1, lastRenderPixelCount);
             lastAvgSteps = pixelCount > 0 ? totalSteps / pixelCount : 0;
             stepReadBuffer.unmap();
             stepReadPending = false;
@@ -741,10 +756,13 @@ export const startFireVolumeSystem = <TTransport extends FireVolumeTransport, TP
 
         let worldMsThisFrame = 0;
         if (refs.worldNeedsRenderRef.current && refs.renderWorldRef.current) {
-          if (refs.compositionModeRef.current !== 'fire_only') {
+          const worldRenderIntervalMs = activeQuality === 'accurate' ? 33 : 50;
+          const worldRenderDue = now - lastWorldRenderAtMs >= worldRenderIntervalMs;
+          if (refs.compositionModeRef.current !== 'fire_only' && worldRenderDue) {
             worldMsThisFrame = refs.renderWorldRef.current();
+            lastWorldRenderAtMs = now;
+            refs.worldNeedsRenderRef.current = false;
           }
-          refs.worldNeedsRenderRef.current = false;
         }
 
         const frameElapsedMs = performance.now() - frameStartMs;

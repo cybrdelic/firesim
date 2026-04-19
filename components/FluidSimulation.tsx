@@ -2775,10 +2775,10 @@ const FluidSimulation: React.FC = () => {
   const [controlsVisible, setControlsVisible] = useState(true);
   const [isPlaying, setIsPlaying] = useState(true);
   const [isSmokeEnabled, setIsSmokeEnabled] = useState(true);
-  const [qualityMode, setQualityMode] = useState<QualityMode>('realtime');
+  const [qualityMode, setQualityMode] = useState<QualityMode>('accurate');
   const [diagnosticsTab, setDiagnosticsTab] = useState<DiagnosticsTab>('runtime');
   const [compositionMode, setCompositionMode] = useState<CompositionDebugMode>('composited');
-  const [fireOcclusionMode, setFireOcclusionMode] = useState<FireOcclusionMode>('depth_coupled');
+  const [fireOcclusionMode, setFireOcclusionMode] = useState<FireOcclusionMode>('analytic_sdf');
   const [fireOverlayMode, setFireOverlayMode] = useState<FireOverlayMode>('final');
   const [runtimeWarning, setRuntimeWarning] = useState<string | null>(null);
   const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
@@ -2918,6 +2918,14 @@ const FluidSimulation: React.FC = () => {
   useEffect(() => { compositionModeRef.current = compositionMode; }, [compositionMode]);
   useEffect(() => { fireOcclusionModeRef.current = fireOcclusionMode; }, [fireOcclusionMode]);
   useEffect(() => { fireOverlayModeRef.current = fireOverlayMode; }, [fireOverlayMode]);
+  useEffect(() => {
+    const runtime = worldRuntimeRef.current;
+    if (!runtime) return;
+    const targetPixelRatio = Math.min(window.devicePixelRatio || 1, qualityMode === 'accurate' ? 1.35 : 1.1);
+    runtime.renderer.setPixelRatio(targetPixelRatio);
+    runtime.renderer.setSize(window.innerWidth, window.innerHeight, false);
+    markWorldDirty();
+  }, [markWorldDirty, qualityMode]);
   useEffect(() => { markWorldDirty(); }, [markWorldDirty, simParams, compositionMode, dimensions.width, dimensions.height, dimensions.pixelRatio]);
 
   useEffect(() => {
@@ -3362,6 +3370,7 @@ const FluidSimulation: React.FC = () => {
     let removeResize = () => {};
 
     const initWorld = async () => {
+      const getWorldPixelRatio = () => Math.min(window.devicePixelRatio || 1, qualityModeRef.current === 'accurate' ? 1.35 : 1.1);
       const renderer = new THREE.WebGPURenderer({
         canvas,
         antialias: true,
@@ -3373,7 +3382,7 @@ const FluidSimulation: React.FC = () => {
         return;
       }
 
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setPixelRatio(getWorldPixelRatio());
       renderer.setSize(window.innerWidth, window.innerHeight, false);
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -3523,7 +3532,7 @@ const FluidSimulation: React.FC = () => {
         const aspect = window.innerWidth / Math.max(1, window.innerHeight);
         runtime.camera.aspect = aspect;
         runtime.camera.updateProjectionMatrix();
-        runtime.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        runtime.renderer.setPixelRatio(getWorldPixelRatio());
         runtime.renderer.setSize(window.innerWidth, window.innerHeight, false);
         worldNeedsRenderRef.current = true;
       };
@@ -4117,6 +4126,18 @@ f32(284, occlusionStepBudget);
   const woodAssetState = worldRuntimeRef.current?.woodAssetState ?? 'no_asset';
   const woodAssetSource = worldRuntimeRef.current?.woodAssetSource ?? '-';
   const woodAssetSourceLabel = woodAssetSource === '-' ? '-' : (woodAssetSource.split('/').pop() ?? woodAssetSource);
+  const overlayShortcutButtons: Array<{
+    mode: FireOverlayMode;
+    label: string;
+    icon: React.ReactNode;
+    tooltip: string;
+  }> = [
+    { mode: 'final', label: 'Final', icon: <Flame size={14} />, tooltip: 'Composite fire shading output.' },
+    { mode: 'alpha', label: 'Alpha', icon: <Eye size={14} />, tooltip: 'Shows the fire coverage mask.' },
+    { mode: 'occlusion', label: 'Occlusion', icon: <Shuffle size={14} />, tooltip: 'Shows the fire/world occlusion mask.' },
+    { mode: 'wood_sdf', label: 'Wood SDF', icon: <Droplet size={14} />, tooltip: 'Visualizes the wood signed-distance field used for masking.' },
+    { mode: 'combustion', label: 'Reaction', icon: <Zap size={14} />, tooltip: 'Shows the combustion/reaction field driving emissive fire.' },
+  ];
 
   const tuningSliders = useMemo(() => {
     const isAll = deckRailSection === 'home';
@@ -4644,12 +4665,20 @@ f32(284, occlusionStepBudget);
               </div>
 
               <div className="deck-overlay-grid" aria-label="Overlay shortcuts">
-                <button type="button" className="deck-overlay-tile" aria-pressed="false"><Thermometer size={14} /><span>Temperature</span><span className="deck-spark" aria-hidden="true" /></button>
-                <button type="button" className="deck-overlay-tile" aria-pressed="false"><Eye size={14} /><span>Soot</span><span className="deck-spark" aria-hidden="true" /></button>
-                <button type="button" className="deck-overlay-tile" aria-pressed="false"><Wind size={14} /><span>Velocity</span><span className="deck-spark" aria-hidden="true" /></button>
-                <button type="button" className="deck-overlay-tile" aria-pressed="false"><Zap size={14} /><span>Fuel</span><span className="deck-spark" aria-hidden="true" /></button>
-                <button type="button" className="deck-overlay-tile" aria-pressed="false"><Shuffle size={14} /><span>Vorticity</span><span className="deck-spark" aria-hidden="true" /></button>
-                <button type="button" className="deck-overlay-tile" aria-pressed="false"><Flame size={14} /><span>Reaction</span><span className="deck-spark" aria-hidden="true" /></button>
+                {overlayShortcutButtons.map((item) => (
+                  <button
+                    key={item.mode}
+                    type="button"
+                    className="deck-overlay-tile"
+                    aria-pressed={fireOverlayMode === item.mode}
+                    data-tooltip={item.tooltip}
+                    onClick={() => handleFireOverlayModeChange(item.mode)}
+                  >
+                    {item.icon}
+                    <span>{item.label}</span>
+                    <span className="deck-spark" aria-hidden="true" />
+                  </button>
+                ))}
               </div>
             </div>
           )}
@@ -4728,8 +4757,8 @@ f32(284, occlusionStepBudget);
                   value={fireOcclusionMode}
                   onChange={(event) => handleFireOcclusionModeChange(event.target.value as FireOcclusionMode)}
                 >
-                  <option value="depth_coupled">Depth Coupled</option>
-                  <option value="analytic_sdf">Analytic SDF</option>
+                  <option value="analytic_sdf">World SDF</option>
+                  <option value="depth_coupled">Approx Depth</option>
                   <option value="none">No Occlusion</option>
                 </select>
               </label>
