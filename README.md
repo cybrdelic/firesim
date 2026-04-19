@@ -41,28 +41,61 @@ npm run build
 npm run preview
 ```
 
+### Stability Harness
+
+Run deterministic stability checks (fuzz + visual regression):
+
+```bash
+npm run test:stability
+```
+
+Generate/update snapshot baselines:
+
+```bash
+npm run test:stability:update
+```
+
+The app supports deterministic sweep mode via URL params:
+
+- `deterministic=1` - fixed simulation time step
+- `sweep=1` - enables readiness/status reporting for automation
+- `scene=<id>` - initial scene preset
+- `grid=<64|128|192|256>` - initial grid size
+- `smoke=<0|1>` - smoke toggle
+- `maxFrames=<n>` - freeze after `n` deterministic frames
+
+Automation status/control hooks are available on `window`:
+
+- `window.__FIRE_SIM_STATUS__`
+- `window.__FIRE_SIM_CONTROL__`
+
+Detailed limits and edge-case notes are documented in [STABILITY.md](STABILITY.md).
+
 ## 🏗️ Project Structure
 
 ```
 firesim/
 ├── components/
-│   ├── FluidSimulation.tsx  # WebGPU fluid/fire simulation engine
-│   ├── CodeBlock.tsx        # UI component for code display
-│   ├── ProgressHeader.tsx   # UI header component
-│   └── SafetyPatternCard.tsx # Info card component
-├── utils/
-│   └── generator.ts         # Utility functions
+│   ├── FluidSimulation.tsx   # Main control deck, world scene, presets, and fire runtime wiring
+│   ├── fluid/
+│   │   ├── assetSystem.ts    # Scanned/procedural log asset loading
+│   │   ├── debugConfig.ts    # Quality, composition, and debug mode mappings
+│   │   ├── fireVolumeSystem.ts # WebGPU render loop and adaptive quality logic
+│   │   └── woodSystem.ts     # Analytic wood SDF and burn-state helpers
+│   └── TooltipLayer.tsx      # Global tooltip surface for deck controls
+├── tests/stability/         # Playwright fuzz + snapshot stability harness
+├── webgpu.d.ts              # Local WebGPU DOM typing surface for this project
 ├── App.tsx                  # Main application component
 ├── types.ts                 # TypeScript type definitions
-└── constants.ts             # Application constants
+└── index.css                # Deck styling
 ```
 
 ## 🎯 How It Works
 
 1. **3D Voxel Grid** - The simulation runs on a 3D grid of voxels
-2. **Compute Shaders** - WGSL shaders handle advection, diffusion, and pressure projection
-3. **Double Buffering** - Ping-pong buffers for density and velocity fields
-4. **Volume Rendering** - Ray marching through the density field to render fire
+2. **Compute Shaders** - WGSL shaders handle advection, combustion, divergence, and pressure projection
+3. **World + Volume Composition** - A Three.js world canvas sits behind a transparent fire volume canvas
+4. **Quality Modes** - `realtime` uses half-resolution temporal upsampling, while `accurate` renders the fire pass at full resolution
 
 ## 🛠️ Tech Stack
 
