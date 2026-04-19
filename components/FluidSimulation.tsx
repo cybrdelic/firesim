@@ -2323,6 +2323,7 @@ interface WorldRuntime {
   floorMaterial: THREE.MeshPhysicalMaterial;
   wallMaterial: THREE.MeshPhysicalMaterial;
   fireAreaLights: [THREE.RectAreaLight, THREE.RectAreaLight];
+  fireLightProbe: THREE.LightProbe;
   radianceSampler: FireRadianceSampler;
   textures: THREE.Texture[];
   logSideMaterial?: THREE.MeshPhysicalMaterial;
@@ -2470,6 +2471,10 @@ const sampleFireRadianceField = (
   };
 
   return sampler.lastField;
+};
+
+const setShColor = (target: THREE.Vector3, color: THREE.Color, scale: number) => {
+  target.set(color.r * scale, color.g * scale, color.b * scale);
 };
 
 const addWorldProps = (scene: THREE.Scene) => {
@@ -3578,6 +3583,9 @@ const FluidSimulation: React.FC = () => {
       fireAreaLightB.lookAt(0.32, 0.34, 0.5);
       scene.add(fireAreaLightB);
 
+      const fireLightProbe = new THREE.LightProbe(new THREE.SphericalHarmonics3(), 0);
+      scene.add(fireLightProbe);
+
       const floorGeometry = new THREE.PlaneGeometry(34, 34);
       floorGeometry.rotateX(-Math.PI / 2);
       const floorMaterial = new THREE.MeshPhysicalMaterial({
@@ -3678,6 +3686,7 @@ const FluidSimulation: React.FC = () => {
         floorMaterial,
         wallMaterial,
         fireAreaLights: [fireAreaLightA, fireAreaLightB],
+        fireLightProbe,
         radianceSampler,
         textures,
         logSideMaterial: logAsset.sideMaterial,
@@ -3747,6 +3756,16 @@ const FluidSimulation: React.FC = () => {
         const lateralBias = radianceField.valid ? radianceField.lateralBias : 0;
         const verticalBias = radianceField.valid ? radianceField.verticalBias : 0;
         const measuredCore = radianceField.valid ? radianceField.coreRatio : 0.4;
+        const probe = runtime.fireLightProbe;
+        const probeWarmth = clamp(0.14 + measuredEnergy * 0.18 + measuredCore * 0.08, 0.08, 0.52);
+        const probeLateral = lateralBias * probeWarmth * 0.32;
+        const probeVertical = clamp(0.08 + probeWarmth * (0.65 + verticalBias * 0.22), 0.06, 0.38);
+        probe.sh.zero();
+        setShColor(probe.sh.coefficients[0], fireColor, probeWarmth);
+        setShColor(probe.sh.coefficients[1], fireColor, probeVertical);
+        setShColor(probe.sh.coefficients[2], fireColor, 0.03 + measuredCore * 0.06);
+        setShColor(probe.sh.coefficients[3], fireColor, probeLateral);
+        probe.intensity = clamp(0.35 + measuredEnergy * 1.15 + measuredSpreadY * 0.35, 0.25, 2.8);
         const flameHeight = clamp(0.5 + p.volumeHeight * 0.22 + measuredSpreadY * 0.42 + glowReach * 0.04, 0.42, 0.98);
         const flameWidth = clamp(0.2 + measuredSpreadX * 0.38 + p.lightingGlow * 0.03, 0.18, 0.52);
         const sideWidth = clamp(flameWidth * (0.58 + measuredCore * 0.22), 0.16, 0.36);
