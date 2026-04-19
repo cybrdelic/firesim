@@ -39,13 +39,13 @@ export interface QualityBudget {
 export const QUALITY_BUDGETS: Record<QualityMode, QualityBudget> = {
   realtime: {
     frameBudgetMs: 16.67,
-    rayStepBudget: 130,
-    occlusionStepBudget: 42,
+    rayStepBudget: 104,
+    occlusionStepBudget: 32,
   },
   accurate: {
     frameBudgetMs: 33.3,
-    rayStepBudget: 180,
-    occlusionStepBudget: 64,
+    rayStepBudget: 136,
+    occlusionStepBudget: 40,
   },
 };
 

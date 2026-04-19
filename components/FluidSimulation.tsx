@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three/webgpu';
+import { RectAreaLightTexturesLib } from 'three/examples/jsm/lights/RectAreaLightTexturesLib.js';
 import {
     addCampfireLogPile,
     WOOD_ASSET_STATE_LABELS,
@@ -125,11 +126,11 @@ class FluidTransport {
     const VOXEL_COUNT = dim * dim * dim;
 
     this.uniformBuffer = device.createBuffer({
-      size: 384,
+      size: 288,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
 
-    this.uniformStaging = new ArrayBuffer(384);
+    this.uniformStaging = new ArrayBuffer(288);
     this.uniformView = new DataView(this.uniformStaging);
 
     const bufferUsage = (window as any).GPUBufferUsage;
@@ -361,7 +362,6 @@ class FluidTransport {
     sceneType: number
   ) {
     const view = this.uniformView;
-    const fireLightRig = deriveFireLightRig(params, now);
 
     view.setFloat32(0, this.dim, true);
     view.setFloat32(4, now / 1000.0, true);
@@ -464,19 +464,6 @@ class FluidTransport {
     view.setFloat32(280, params.rayStepBudget ?? 160.0, true);
     view.setFloat32(284, params.occlusionStepBudget ?? 80.0, true);
 
-    fireLightRig.forEach((light, index) => {
-      const posOffset = 288 + index * 32;
-      const colorOffset = posOffset + 16;
-      view.setFloat32(posOffset + 0, light.position[0], true);
-      view.setFloat32(posOffset + 4, light.position[1], true);
-      view.setFloat32(posOffset + 8, light.position[2], true);
-      view.setFloat32(posOffset + 12, light.range, true);
-      view.setFloat32(colorOffset + 0, light.color[0], true);
-      view.setFloat32(colorOffset + 4, light.color[1], true);
-      view.setFloat32(colorOffset + 8, light.color[2], true);
-      view.setFloat32(colorOffset + 12, light.intensity, true);
-    });
-
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformStaging);
   }
 }
@@ -575,13 +562,6 @@ struct SimParams {
   occlusionMode: f32,
   rayStepBudget: f32,
   occlusionStepBudget: f32,
-
-  fireLightPosRange0: vec4f,
-  fireLightColorIntensity0: vec4f,
-  fireLightPosRange1: vec4f,
-  fireLightColorIntensity1: vec4f,
-  fireLightPosRange2: vec4f,
-  fireLightColorIntensity2: vec4f,
 };
 `;
 
@@ -1450,25 +1430,7 @@ fn getBlackbodyColor(temp: f32) -> vec3f {
    }
 }
 
-fn get_fire_light_pos_range(index: i32) -> vec4f {
-  if (index == 0) { return params.fireLightPosRange0; }
-  if (index == 1) { return params.fireLightPosRange1; }
-  return params.fireLightPosRange2;
-}
-
-fn get_fire_light_color_intensity(index: i32) -> vec4f {
-  if (index == 0) { return params.fireLightColorIntensity0; }
-  if (index == 1) { return params.fireLightColorIntensity1; }
-  return params.fireLightColorIntensity2;
-}
-
-fn point_light_falloff(distanceToLight: f32, range: f32) -> f32 {
-  let normalized = clamp(1.0 - distanceToLight / max(range, 1e-4), 0.0, 1.0);
-  let smooth = normalized * normalized * (3.0 - 2.0 * normalized);
-  return smooth * smooth / max(1.0, 0.45 + distanceToLight * distanceToLight * 0.55);
-}
-
-fn get_sky_light_transmittance(pos: vec3f, lightDir: vec3f) -> f32 {
+fn get_light_transmittance(pos: vec3f, lightDir: vec3f) -> f32 {
   var p = pos;
   let step = 0.11;
   var tau = 0.0;
@@ -1501,39 +1463,6 @@ fn get_sky_light_transmittance(pos: vec3f, lightDir: vec3f) -> f32 {
     let sigmaA = sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12;
     let sigmaS = sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55;
     tau += (sigmaA + sigmaS) * step;
-  }
-  return exp(-tau);
-}
-
-fn get_fire_light_transmittance(pos: vec3f, lightPos: vec3f, lightDist: f32) -> f32 {
-  let dir = safe_norm(lightPos - pos, vec3f(0.0, 1.0, 0.0));
-  let stepCount = 4;
-  let step = max(0.03, lightDist / f32(stepCount));
-  var p = pos + dir * step * 0.5;
-  var tau = 0.0;
-  for (var i = 0; i < stepCount; i++) {
-    let m = sample_medium_world(p);
-    let soot = m.y;
-    let temp = m.x;
-    if ((soot + temp) >= 1e-5) {
-      let uv = to_volume_uv(p);
-      let hot = smoothstep(0.35, 0.7, temp);
-      let cool = smoothstep(params.T_hazeStart, params.T_hazeFull, 1.0 - temp);
-      let height = smoothstep(0.22, 0.92, uv.y);
-      let sootVis = mix(1.0, 0.25, hot);
-      let sootRaw = soot * sootVis;
-      let hazeRaw = soot * cool * height;
-      let sootOpt = 1.0 - exp(-sootRaw * 0.35);
-      let hazeOpt = 1.0 - exp(-hazeRaw * 0.12);
-      let thickness = max(0.25, params.smokeThickness);
-      let darkness = clamp(params.smokeDarkness, 0.0, 1.0);
-      let absorption = params.absorption * thickness * (0.65 + 0.7 * darkness);
-      let scattering = params.scattering * thickness * (0.85 - 0.55 * darkness);
-      let sigmaA = sootOpt * absorption * 1.10 + hazeOpt * absorption * 0.12;
-      let sigmaS = sootOpt * scattering * 0.12 + hazeOpt * scattering * 0.55;
-      tau += (sigmaA + sigmaS) * step;
-    }
-    p += dir * step;
   }
   return exp(-tau);
 }
@@ -1655,6 +1584,8 @@ fn intersect_occluders(ro: vec3f, rd: vec3f, minT: f32, maxT: f32, useSdfOcclude
   let baseStep = max(1e-4, maxTraceDist / f32(steps));
   var t = marchStart + baseStep * (0.5 + jitter);
   var accumCol = vec3f(0.0); var transmittance = 1.0; let phaseSun = phase_function(dot(rd, lightDir), params.anisotropyG);
+  var cachedSunTrans = 1.0;
+  var shadowRefreshCountdown = 0;
   var maxReactionSeen = 0.0;
   var minWoodDist = 1e6;
   var stepsTaken = 0u;
@@ -1746,40 +1677,32 @@ fn intersect_occluders(ro: vec3f, rd: vec3f, minT: f32, maxT: f32, useSdfOcclude
         // Keep a small in-flame extinction term so emissive sheets integrate smoothly.
         let sigmaT = max(1e-5, sigmaA + sigmaS + reaction * 0.045);
         let stepTrans = exp(-sigmaT * localStep);
-        let sunTrans = get_sky_light_transmittance(pos, lightDir);
+
+        if (shadowRefreshCountdown <= 0) {
+          cachedSunTrans = get_light_transmittance(pos, lightDir);
+          let denseMedium = reaction > 0.08 || sigmaT > 0.55;
+          shadowRefreshCountdown = select(8, 2, denseMedium);
+        } else {
+          shadowRefreshCountdown -= 1;
+        }
+
+        let sunTrans = cachedSunTrans;
         let sootTint = vec3f(0.10, 0.09, 0.085);
         let hazeTint = vec3f(0.18, 0.18, 0.19);
         let warmHazeTint = vec3f(0.28, 0.20, 0.14);
         let sootFrac = clamp(sootOpt / max(1e-6, sootOpt + hazeOpt), 0.0, 1.0);
         let hazeMix = clamp(hot * (1.0 - sootFrac) * 0.55, 0.0, 0.55);
         let smokeTint = mix(mix(hazeTint, warmHazeTint, hazeMix), sootTint, sootFrac);
-        let skyScatter = vec3f(4.2) * sunTrans * phaseSun * smokeTint;
-        var fireScatterRadiance = vec3f(0.0);
-        var dominantFireLight = 0.0;
-        for (var lightIndex = 0; lightIndex < 3; lightIndex++) {
-          let proxyPosRange = get_fire_light_pos_range(lightIndex);
-          let proxyColorIntensity = get_fire_light_color_intensity(lightIndex);
-          let toLight = proxyPosRange.xyz - pos;
-          let lightDist = length(toLight);
-          if (lightDist < proxyPosRange.w) {
-            let fireLightTrans = get_fire_light_transmittance(pos, proxyPosRange.xyz, lightDist);
-            let falloff = point_light_falloff(lightDist, proxyPosRange.w);
-            let proxyRadiance = proxyColorIntensity.rgb * (proxyColorIntensity.a * fireLightTrans * falloff);
-            fireScatterRadiance += proxyRadiance;
-            dominantFireLight = max(dominantFireLight, fireLightTrans * falloff);
-          }
-        }
-        let fireScatterTint = mix(vec3f(1.0, 0.38, 0.10), vec3f(1.0, 0.68, 0.28), hot);
-        let scatterRadiance =
-          skyScatter +
-          smokeTint * fireScatterRadiance * (0.22 + 0.5 * (1.0 - sootFrac)) +
-          fireScatterTint * fireScatterRadiance * (0.05 + reaction * 0.1);
+        let shadowTr = max(0.35, mix(1.0, sunTrans, 0.35));
+        let skyScatter = vec3f(8.0) * sunTrans * phaseSun * smokeTint;
+        let fireScatterColor = mix(vec3f(0.95, 0.34, 0.08), vec3f(1.0, 0.62, 0.24), hot);
+        let fireScatterStrength = params.lightingGlow * shadowTr * (0.05 + reaction * 0.52 + hazeOpt * 0.12);
+        let scatterRadiance = skyScatter + fireScatterColor * fireScatterStrength;
         let scatterWeight = (sigmaS / max(1e-6, sigmaT)) * (1.0 - stepTrans);
         accumCol += scatterRadiance * scatterWeight * transmittance;
 
         // Flame-only emission: reaction emits, soot only attenuates.
         // Apply a *soft* self-shadow (don't zero out emission inside smoke).
-        let shadowTr = max(0.32, dominantFireLight * 0.88 + sunTrans * 0.12);
         let microFlame = clamp(1.0 + detail * 0.18, 0.7, 1.3);
         let reactionEm = pow(clamp(reaction, 0.0, 1.0), 1.55);
         let coreCompression = 1.0 / (1.0 + max(0.0, temp - 1.05) * 0.55 + reaction * 0.22);
@@ -2320,73 +2243,14 @@ const INITIAL_PARAMS: SimParamState = {
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 const lerp = (start: number, end: number, t: number) => start + (end - start) * t;
 const inverseLerp = (start: number, end: number, value: number) => (value - start) / Math.max(1e-9, end - start);
-type FireLightProxy = {
-  position: [number, number, number];
-  target: [number, number, number];
-  color: [number, number, number];
-  intensity: number;
-  range: number;
-  angle: number;
-  penumbra: number;
-  castShadow: boolean;
-};
+let rectAreaLightLtcInitialized = false;
 
-const deriveFireLightRig = (
-  params: Pick<SimParamState,
-    'emission' | 'fuelEfficiency' | 'buoyancy' | 'smokeDissipation' | 'smokeWeight' | 'smokeDarkness' |
-    'lightingGlow' | 'lightingFireIntensity' | 'lightingFireFalloff' | 'lightingFlicker' | 'floorFireBounce' |
-    'volumeHeight'
-  >,
-  nowMs: number
-): FireLightProxy[] => {
-  const time = nowMs * 0.001;
-  const flickerA = Math.sin(time * 6.7) * 0.5 + Math.sin(time * 12.9 + 0.7) * 0.32 + Math.sin(time * 19.7 + 2.1) * 0.18;
-  const flickerB = Math.sin(time * 4.2 + 0.5) * 0.42 + Math.sin(time * 8.9 + 1.7) * 0.26;
-  const flickerC = Math.sin(time * 5.1 + 1.2) * 0.28 + Math.sin(time * 15.2 + 2.8) * 0.17;
-  const flickerAmount = clamp(0.03 + params.lightingFlicker * 0.08, 0.03, 0.11);
-  const smokeLoad = clamp((1.0 - params.smokeDissipation) * 40.0 + Math.max(0.0, params.smokeWeight) * 0.04 + params.smokeDarkness * 0.45, 0.0, 1.35);
-  const fireEnergy = clamp(0.26 + params.emission * 0.09 + params.fuelEfficiency * 0.15 + params.buoyancy * 0.06, 0.4, 1.85);
-  const fireHeat = clamp(fireEnergy * (1.0 + flickerA * flickerAmount), 0.3, 2.2);
-  const glowReach = clamp(0.4 + params.lightingGlow * 0.35 + params.lightingFireFalloff * 0.18, 0.35, 1.85);
-  const floorBounce = clamp(fireHeat * (0.22 + params.floorFireBounce * 0.28), 0.0, 1.8);
-  const wallWash = clamp(fireHeat * glowReach * (0.14 + params.lightingFireIntensity * 0.12) - smokeLoad * 0.05, 0.0, 1.4);
-  const height = params.volumeHeight;
-  const yBase = 0.12 + height * 0.14;
-  const wobbleX = Math.sin(time * 2.6) * 0.035 + flickerB * 0.015;
-  const wobbleZ = Math.cos(time * 2.1 + 0.4) * 0.03 + flickerC * 0.012;
-
-  return [
-    {
-      position: [0.5 + wobbleX, yBase + 0.34 + fireHeat * 0.06, 0.72 + wobbleZ * 0.45],
-      target: [0.5, 0.14, 0.34],
-      color: [1.0, 0.72 + fireHeat * 0.08, 0.36 + fireHeat * 0.05],
-      intensity: clamp(2.6 + fireHeat * (2.0 + params.lightingFireIntensity * 1.15), 1.6, 8.4),
-      range: clamp(2.4 + params.lightingFireFalloff * 0.9 + glowReach * 0.8, 1.8, 5.8),
-      angle: 0.85,
-      penumbra: 0.45,
-      castShadow: true,
-    },
-    {
-      position: [0.68 + wobbleX * 0.6, 0.42 + height * 0.26 + wallWash * 0.05, -0.08 + wobbleZ * 0.25],
-      target: [0.44, 1.05, -2.8],
-      color: [1.0, 0.52 + wallWash * 0.14, 0.2 + wallWash * 0.08],
-      intensity: clamp(0.8 + wallWash * (2.0 + params.lightingGlow * 0.7), 0.35, 4.8),
-      range: clamp(3.2 + params.lightingFireFalloff * 1.3 + glowReach * 1.1, 2.4, 7.8),
-      angle: 0.62,
-      penumbra: 0.38,
-      castShadow: true,
-    },
-    {
-      position: [0.5 - wobbleX * 0.4, 0.08, 0.12 + wobbleZ * 0.35],
-      target: [0.5, 0.3, -0.1],
-      color: [1.0, 0.42 + floorBounce * 0.1, 0.16 + floorBounce * 0.05],
-      intensity: clamp(0.18 + floorBounce * 2.3, 0.05, 4.2),
-      range: clamp(1.8 + params.lightingFireFalloff * 0.8 + params.floorFireBounce * 0.55, 1.4, 5.4),
-      angle: 1.02,
-      penumbra: 0.6,
-      castShadow: false,
-    },
-  ];
+const ensureRectAreaLightLtc = () => {
+  if (rectAreaLightLtcInitialized) return;
+  const lightNodeApi = (THREE as typeof THREE & { RectAreaLightNode?: { setLTC: (ltc: unknown) => void } }).RectAreaLightNode;
+  if (!lightNodeApi?.setLTC) return;
+  lightNodeApi.setLTC(RectAreaLightTexturesLib.init());
+  rectAreaLightLtcInitialized = true;
 };
 
 const roundToStep = (value: number, step: number, min = 0) => {
@@ -2458,10 +2322,8 @@ interface WorldRuntime {
   camera: THREE.PerspectiveCamera;
   floorMaterial: THREE.MeshPhysicalMaterial;
   wallMaterial: THREE.MeshPhysicalMaterial;
-  keyLight: THREE.DirectionalLight;
-  fillLight: THREE.HemisphereLight;
-  fireProxyLights: [THREE.SpotLight, THREE.SpotLight, THREE.SpotLight];
-  fireProxyTargets: [THREE.Object3D, THREE.Object3D, THREE.Object3D];
+  fireAreaLights: [THREE.RectAreaLight, THREE.RectAreaLight];
+  radianceSampler: FireRadianceSampler;
   textures: THREE.Texture[];
   logSideMaterial?: THREE.MeshPhysicalMaterial;
   logCapMaterial?: THREE.MeshPhysicalMaterial;
@@ -2474,33 +2336,140 @@ interface WorldRuntime {
   lastWorldRenderMs: number;
 }
 
-const setObjectShadowMode = (root: THREE.Object3D, castShadow: boolean, receiveShadow: boolean) => {
-  root.traverse((child) => {
-    const mesh = child as THREE.Mesh;
-    if (!mesh.isMesh) return;
-    mesh.castShadow = castShadow;
-    mesh.receiveShadow = receiveShadow;
-  });
+type FireRadianceField = {
+  valid: boolean;
+  energy: number;
+  color: THREE.Color;
+  lateralBias: number;
+  verticalBias: number;
+  spreadX: number;
+  spreadY: number;
+  coreRatio: number;
 };
 
-const createFireProxyLight = (
-  scene: THREE.Scene,
-  castShadow: boolean,
-  shadowMapSize: number
-) => {
-  const light = new THREE.SpotLight(0xff8a3c, 1.0, 4.0, Math.PI * 0.3, 0.45, 1.8);
-  const target = new THREE.Object3D();
-  scene.add(target);
-  light.target = target;
-  light.castShadow = castShadow;
-  light.shadow.mapSize.set(shadowMapSize, shadowMapSize);
-  light.shadow.bias = -0.00035;
-  light.shadow.normalBias = 0.025;
-  light.shadow.radius = 1.4;
-  light.shadow.camera.near = 0.08;
-  light.shadow.camera.far = 9.0;
-  scene.add(light);
-  return { light, target };
+type FireRadianceSampler = {
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+  width: number;
+  height: number;
+  lastSampleMs: number;
+  lastField: FireRadianceField;
+};
+
+const createFireRadianceSampler = (width = 24, height = 32): FireRadianceSampler | null => {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+  return {
+    canvas,
+    ctx,
+    width,
+    height,
+    lastSampleMs: -1,
+    lastField: {
+      valid: false,
+      energy: 0,
+      color: new THREE.Color(0xff8a3c),
+      lateralBias: 0,
+      verticalBias: 0,
+      spreadX: 0.22,
+      spreadY: 0.4,
+      coreRatio: 0.4,
+    },
+  };
+};
+
+const sampleFireRadianceField = (
+  sampler: FireRadianceSampler,
+  sourceCanvas: HTMLCanvasElement | null,
+  nowMs: number,
+  minIntervalMs: number
+): FireRadianceField => {
+  if (!sourceCanvas) return sampler.lastField;
+  if (sampler.lastSampleMs >= 0 && nowMs - sampler.lastSampleMs < minIntervalMs) return sampler.lastField;
+  sampler.lastSampleMs = nowMs;
+
+  const { ctx, width, height } = sampler;
+  ctx.clearRect(0, 0, width, height);
+  ctx.drawImage(sourceCanvas, 0, 0, width, height);
+  const image = ctx.getImageData(0, 0, width, height).data;
+
+  let total = 0;
+  let sumX = 0;
+  let sumY = 0;
+  let sumXX = 0;
+  let sumYY = 0;
+  let left = 0;
+  let right = 0;
+  let top = 0;
+  let bottom = 0;
+  let core = 0;
+  let colorR = 0;
+  let colorG = 0;
+  let colorB = 0;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const index = (y * width + x) * 4;
+      const r = image[index] / 255;
+      const g = image[index + 1] / 255;
+      const b = image[index + 2] / 255;
+      const a = image[index + 3] / 255;
+      const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      const weight = luminance * a;
+      if (weight <= 0.01) continue;
+
+      const nx = (x + 0.5) / width;
+      const ny = (y + 0.5) / height;
+      total += weight;
+      sumX += nx * weight;
+      sumY += ny * weight;
+      sumXX += nx * nx * weight;
+      sumYY += ny * ny * weight;
+      colorR += r * weight;
+      colorG += g * weight;
+      colorB += b * weight;
+      if (nx < 0.5) left += weight;
+      else right += weight;
+      if (ny < 0.5) top += weight;
+      else bottom += weight;
+      if (luminance > 0.55) core += weight;
+    }
+  }
+
+  if (total <= 1e-4) {
+    sampler.lastField = {
+      ...sampler.lastField,
+      valid: false,
+      energy: 0,
+    };
+    return sampler.lastField;
+  }
+
+  const meanX = sumX / total;
+  const meanY = sumY / total;
+  const varX = Math.max(0, sumXX / total - meanX * meanX);
+  const varY = Math.max(0, sumYY / total - meanY * meanY);
+  const nextColor = new THREE.Color(
+    clamp(colorR / total, 0, 1),
+    clamp(colorG / total, 0, 1),
+    clamp(colorB / total, 0, 1)
+  );
+
+  sampler.lastField = {
+    valid: true,
+    energy: clamp(total / 34, 0, 1.8),
+    color: nextColor,
+    lateralBias: clamp((right - left) / total, -1, 1),
+    verticalBias: clamp((bottom - top) / total, -1, 1),
+    spreadX: clamp(Math.sqrt(varX) * 2.8, 0.12, 0.65),
+    spreadY: clamp(Math.sqrt(varY) * 3.1, 0.18, 0.9),
+    coreRatio: clamp(core / total, 0, 1),
+  };
+
+  return sampler.lastField;
 };
 
 const addWorldProps = (scene: THREE.Scene) => {
@@ -2526,20 +2495,20 @@ const addWorldProps = (scene: THREE.Scene) => {
 
   const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.16, 48, 48), reflectiveMaterial);
   sphere.position.set(1.08, 0.16, 0.26);
-  sphere.castShadow = true;
-  sphere.receiveShadow = true;
+  sphere.castShadow = false;
+  sphere.receiveShadow = false;
   scene.add(sphere);
 
   const box = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.26, 0.26), stoneMaterial);
   box.position.set(-0.06, 0.13, 0.34);
-  box.castShadow = true;
-  box.receiveShadow = true;
+  box.castShadow = false;
+  box.receiveShadow = false;
   scene.add(box);
 
   const capsule = new THREE.Mesh(new THREE.CapsuleGeometry(0.1, 0.24, 14, 24), baseMaterial);
   capsule.position.set(0.34, 0.22, -0.1);
-  capsule.castShadow = true;
-  capsule.receiveShadow = true;
+  capsule.castShadow = false;
+  capsule.receiveShadow = false;
   scene.add(capsule);
 };
 
@@ -2784,21 +2753,21 @@ const makeProceduralLogObject = (
   const heightSegments = 24;
   const cylinderGeo = new THREE.CylinderGeometry(radius, radius, length, radialSegments, heightSegments, true);
   const cylinder = new THREE.Mesh(cylinderGeo, materials.side);
-  cylinder.castShadow = true;
-  cylinder.receiveShadow = true;
+  cylinder.castShadow = false;
+  cylinder.receiveShadow = false;
   group.add(cylinder);
 
   const sphereGeo = new THREE.SphereGeometry(radius, 40, 24);
   const capA = new THREE.Mesh(sphereGeo, materials.cap);
   capA.position.y = length * 0.5;
-  capA.castShadow = true;
-  capA.receiveShadow = true;
+  capA.castShadow = false;
+  capA.receiveShadow = false;
   group.add(capA);
 
   const capB = new THREE.Mesh(sphereGeo, materials.cap);
   capB.position.y = -length * 0.5;
-  capB.castShadow = true;
-  capB.receiveShadow = true;
+  capB.castShadow = false;
+  capB.receiveShadow = false;
   group.add(capB);
 
   // Small visual variation that does NOT change the capsule silhouette.
@@ -2820,8 +2789,8 @@ const applyFallbackLogMaterial = (root: THREE.Object3D) => {
   root.traverse((child) => {
     const mesh = child as THREE.Mesh;
     if (!mesh.isMesh) return;
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
     const material = mesh.material as THREE.Material | THREE.Material[] | undefined;
     if (!material) {
       mesh.material = fallbackMaterial;
@@ -3025,7 +2994,7 @@ const FluidSimulation: React.FC = () => {
   };
 
   const [gridSize, setGridSize] = useState(readInitialGridSize);
-  const [runtimeResolutionScale, setRuntimeResolutionScale] = useState(1);
+  const [runtimeResolutionScale, setRuntimeResolutionScale] = useState(0.9);
   const [simParams, setSimParams] = useState<SimParamState>({ ...INITIAL_PARAMS });
   const [lockedParams, setLockedParams] = useState<Record<EditableParamKey, boolean>>(() => (
     Object.fromEntries(PARAM_SPECS.map((spec) => [spec.key, false])) as Record<EditableParamKey, boolean>
@@ -3108,7 +3077,7 @@ const FluidSimulation: React.FC = () => {
   useEffect(() => {
     const runtime = worldRuntimeRef.current;
     if (!runtime) return;
-    const targetPixelRatio = Math.min(window.devicePixelRatio || 1, qualityMode === 'accurate' ? 1.35 : 1.1);
+    const targetPixelRatio = Math.min(window.devicePixelRatio || 1, qualityMode === 'accurate' ? 0.95 : 0.85);
     runtime.renderer.setPixelRatio(targetPixelRatio);
     runtime.renderer.setSize(window.innerWidth, window.innerHeight, false);
     markWorldDirty();
@@ -3557,7 +3526,7 @@ const FluidSimulation: React.FC = () => {
     let removeResize = () => {};
 
     const initWorld = async () => {
-      const getWorldPixelRatio = () => Math.min(window.devicePixelRatio || 1, qualityModeRef.current === 'accurate' ? 1.35 : 1.1);
+      const getWorldPixelRatio = () => Math.min(window.devicePixelRatio || 1, qualityModeRef.current === 'accurate' ? 0.9 : 0.8);
       const renderer = new THREE.WebGPURenderer({
         canvas,
         antialias: true,
@@ -3574,28 +3543,23 @@ const FluidSimulation: React.FC = () => {
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
       renderer.toneMappingExposure = 1.0;
-      renderer.shadowMap.enabled = true;
-      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.shadowMap.enabled = false;
+      ensureRectAreaLightLtc();
+      const radianceSampler = createFireRadianceSampler() ?? createFireRadianceSampler(16, 24);
+      if (!radianceSampler) {
+        throw new Error('Unable to initialize fire radiance sampler');
+      }
 
       const scene = new THREE.Scene();
-      const skyDay = new THREE.Color(0x9eb6cc);
-      const skyNight = new THREE.Color(0x111a25);
-      const skyMix = new THREE.Color();
+      const skyNight = new THREE.Color(0x10151d);
       const floorBaseColor = new THREE.Color(0x868b90);
-      const floorWarmColor = new THREE.Color(0x9a765d);
-      const floorHotColor = new THREE.Color(0xc58b5e);
       const wallBaseColor = new THREE.Color(0x434950);
-      const wallWarmColor = new THREE.Color(0x6d564b);
-      const wallHotColor = new THREE.Color(0x9a6d52);
-      const fillSkyBase = new THREE.Color(0x9fbfe0);
-      const fillGroundBase = new THREE.Color(0x2a3038);
-      const fillGroundWarm = new THREE.Color(0x40251a);
+      const emberLightColor = new THREE.Color(0xff641f);
+      const flameLightColor = new THREE.Color(0xffa34d);
+      const coreLightColor = new THREE.Color(0xfff0c0);
       const fireColor = new THREE.Color();
-      const bounceColor = new THREE.Color();
-      const floorTint = new THREE.Color();
-      const wallTint = new THREE.Color();
-      scene.background = skyDay.clone();
-      scene.fog = new THREE.Fog(0x9eb6cc, 3.5, 26.0);
+      scene.background = skyNight.clone();
+      scene.fog = new THREE.Fog(skyNight.getHex(), 3.5, 26.0);
 
       const camera = new THREE.PerspectiveCamera(
         90,
@@ -3604,17 +3568,15 @@ const FluidSimulation: React.FC = () => {
         120
       );
 
-      const keyLight = new THREE.DirectionalLight(0xfff2dd, 2.2);
-      keyLight.position.set(-2.6, 4.8, -1.2);
-      keyLight.castShadow = false;
-      scene.add(keyLight);
+      const fireAreaLightA = new THREE.RectAreaLight(0xff8a3c, 4.0, 0.46, 0.92);
+      fireAreaLightA.position.set(0.5, 0.42, 0.62);
+      fireAreaLightA.lookAt(0.5, 0.38, 0.18);
+      scene.add(fireAreaLightA);
 
-      const fillLight = new THREE.HemisphereLight(0x9fbfe0, 0x2a3038, 0.48);
-      scene.add(fillLight);
-
-      const fireProxy0 = createFireProxyLight(scene, true, 512);
-      const fireProxy1 = createFireProxyLight(scene, true, 384);
-      const fireProxy2 = createFireProxyLight(scene, false, 256);
+      const fireAreaLightB = new THREE.RectAreaLight(0xff8a3c, 2.8, 0.34, 0.72);
+      fireAreaLightB.position.set(0.82, 0.34, 0.5);
+      fireAreaLightB.lookAt(0.32, 0.34, 0.5);
+      scene.add(fireAreaLightB);
 
       const floorGeometry = new THREE.PlaneGeometry(34, 34);
       floorGeometry.rotateX(-Math.PI / 2);
@@ -3629,7 +3591,7 @@ const FluidSimulation: React.FC = () => {
       });
       const floorMesh = new THREE.Mesh(floorGeometry, floorMaterial);
       floorMesh.position.set(0.5, 0.0, 0.5);
-      floorMesh.receiveShadow = true;
+      floorMesh.receiveShadow = false;
       floorMesh.castShadow = false;
       scene.add(floorMesh);
 
@@ -3642,7 +3604,7 @@ const FluidSimulation: React.FC = () => {
       });
       const wall = new THREE.Mesh(new THREE.PlaneGeometry(24, 8), wallMaterial);
       wall.position.set(0.5, 3.25, -3.4);
-      wall.receiveShadow = true;
+      wall.receiveShadow = false;
       wall.castShadow = false;
       scene.add(wall);
 
@@ -3656,9 +3618,6 @@ const FluidSimulation: React.FC = () => {
         normalizeLogSource,
         applyFallbackLogMaterial,
       });
-      setObjectShadowMode(scene, true, true);
-      floorMesh.castShadow = false;
-      wall.castShadow = false;
       if (logAsset.textures?.length) textures.push(...logAsset.textures);
       if (logAsset.assetState === 'scanned_asset_ready') {
         pushTimeline(`AssetSystem ${WOOD_ASSET_STATE_LABELS[logAsset.assetState]} (${logAsset.source})`);
@@ -3718,10 +3677,8 @@ const FluidSimulation: React.FC = () => {
         camera,
         floorMaterial,
         wallMaterial,
-        keyLight,
-        fillLight,
-        fireProxyLights: [fireProxy0.light, fireProxy1.light, fireProxy2.light],
-        fireProxyTargets: [fireProxy0.target, fireProxy1.target, fireProxy2.target],
+        fireAreaLights: [fireAreaLightA, fireAreaLightB],
+        radianceSampler,
         textures,
         logSideMaterial: logAsset.sideMaterial,
         logCapMaterial: logAsset.capMaterial,
@@ -3757,62 +3714,74 @@ const FluidSimulation: React.FC = () => {
         runtime.camera.lookAt(cam.target[0], cam.target[1], cam.target[2]);
 
         const p = paramsRef.current;
-        const dayBlend = clamp(1.0 - p.lightingFlicker, 0.0, 1.0);
-        const fireRig = deriveFireLightRig(p, worldStartMs);
-        const floorBounce = clamp(fireRig[2].intensity * 0.42, 0.0, 1.8);
-        const wallBounce = clamp(fireRig[1].intensity * 0.28, 0.0, 1.4);
-        fireColor.setRGB(fireRig[0].color[0], fireRig[0].color[1], fireRig[0].color[2]);
-        bounceColor.setRGB(fireRig[2].color[0], fireRig[2].color[1], fireRig[2].color[2]);
-        skyMix.copy(skyNight).lerp(skyDay, dayBlend);
-        runtime.scene.background = skyMix;
-        (runtime.scene.fog as THREE.Fog).color.copy(skyMix);
+        const fireTime = worldStartMs * 0.001;
+        const flickerBand =
+          Math.sin(fireTime * 6.7) * 0.5 +
+          Math.sin(fireTime * 12.9 + 0.7) * 0.32 +
+          Math.sin(fireTime * 19.7 + 2.1) * 0.18;
+        const flicker = 1.0 + flickerBand * clamp(0.03 + p.lightingFlicker * 0.08, 0.03, 0.11);
+        const fireEnergy = clamp(0.26 + p.emission * 0.09 + p.fuelEfficiency * 0.15 + p.buoyancy * 0.06, 0.4, 1.85);
+        const fireHeat = clamp(fireEnergy * flicker, 0.3, 2.2);
+        const glowReach = clamp(0.4 + p.lightingGlow * 0.35 + p.lightingFireFalloff * 0.18, 0.35, 1.85);
+        const paramFireColor = fireColor.copy(emberLightColor)
+          .lerp(flameLightColor, clamp(0.34 + fireHeat * 0.34, 0.0, 1.0))
+          .lerp(coreLightColor, clamp((fireHeat - 0.85) * 0.45, 0.0, 0.42));
+        const radianceField = sampleFireRadianceField(
+          runtime.radianceSampler,
+          canvasRef.current,
+          worldStartMs,
+          qualityModeRef.current === 'accurate' ? 90 : 120
+        );
+        if (radianceField.valid) {
+          fireColor.copy(paramFireColor).lerp(radianceField.color, 0.7);
+        }
+        runtime.scene.background = skyNight;
+        (runtime.scene.fog as THREE.Fog).color.copy(skyNight);
         runtime.renderer.toneMappingExposure = clamp(p.exposure * 0.95, 0.45, 1.8);
 
-        runtime.keyLight.intensity = clamp(0.85 + p.floorAmbient * 1.55 - floorBounce * 0.08, 0.5, 3.2);
-        runtime.fillLight.intensity = clamp(0.18 + p.floorAmbient * 0.82 + floorBounce * 0.06, 0.1, 1.6);
-        runtime.fillLight.color.copy(fillSkyBase).lerp(fireColor, clamp(floorBounce * 0.04, 0.0, 0.14));
-        runtime.fillLight.groundColor.copy(fillGroundBase).lerp(fillGroundWarm, clamp(floorBounce * 0.18, 0.0, 0.52));
+        const primaryAreaLight = runtime.fireAreaLights[0];
+        const secondaryAreaLight = runtime.fireAreaLights[1];
+        const measuredEnergy = radianceField.valid ? radianceField.energy : 0;
+        const measuredSpreadX = radianceField.valid ? radianceField.spreadX : 0.22;
+        const measuredSpreadY = radianceField.valid ? radianceField.spreadY : 0.42;
+        const lateralBias = radianceField.valid ? radianceField.lateralBias : 0;
+        const verticalBias = radianceField.valid ? radianceField.verticalBias : 0;
+        const measuredCore = radianceField.valid ? radianceField.coreRatio : 0.4;
+        const flameHeight = clamp(0.5 + p.volumeHeight * 0.22 + measuredSpreadY * 0.42 + glowReach * 0.04, 0.42, 0.98);
+        const flameWidth = clamp(0.2 + measuredSpreadX * 0.38 + p.lightingGlow * 0.03, 0.18, 0.52);
+        const sideWidth = clamp(flameWidth * (0.58 + measuredCore * 0.22), 0.16, 0.36);
+        primaryAreaLight.position.set(0.5 + lateralBias * 0.07, 0.2 + flameHeight * 0.48 + verticalBias * 0.04, 0.62);
+        primaryAreaLight.width = flameWidth;
+        primaryAreaLight.height = flameHeight;
+        primaryAreaLight.color.copy(fireColor);
+        primaryAreaLight.intensity = clamp(1.9 + fireHeat * 2.0 + measuredEnergy * (4.4 + p.lightingFireIntensity * 0.85), 1.4, 13.0);
+        primaryAreaLight.lookAt(0.5 + lateralBias * 0.03, 0.18 + flameHeight * 0.34, 0.18);
 
-        fireRig.forEach((proxy, index) => {
-          const light = runtime.fireProxyLights[index];
-          const target = runtime.fireProxyTargets[index];
-          light.position.set(proxy.position[0], proxy.position[1], proxy.position[2]);
-          target.position.set(proxy.target[0], proxy.target[1], proxy.target[2]);
-          light.color.setRGB(proxy.color[0], proxy.color[1], proxy.color[2]);
-          light.intensity = proxy.intensity;
-          light.distance = proxy.range;
-          light.angle = proxy.angle;
-          light.penumbra = proxy.penumbra;
-          light.castShadow = proxy.castShadow;
-          light.shadow.camera.far = Math.max(2.5, proxy.range + 1.2);
-          light.shadow.needsUpdate = true;
-          target.updateMatrixWorld();
-        });
+        secondaryAreaLight.position.set(0.82, 0.16 + flameHeight * 0.34 + verticalBias * 0.03, 0.5 + lateralBias * 0.02);
+        secondaryAreaLight.width = sideWidth;
+        secondaryAreaLight.height = flameHeight * clamp(0.68 + measuredSpreadY * 0.22, 0.62, 0.9);
+        secondaryAreaLight.color.copy(fireColor).lerp(coreLightColor, 0.08);
+        secondaryAreaLight.intensity = clamp(primaryAreaLight.intensity * (0.42 + measuredCore * 0.18), 0.7, 7.4);
+        secondaryAreaLight.lookAt(0.24, 0.18 + flameHeight * 0.28, 0.5);
 
-        floorTint.copy(floorBaseColor)
-          .lerp(floorWarmColor, clamp(floorBounce * 0.18, 0.0, 0.34))
-          .lerp(floorHotColor, clamp((floorBounce - 0.55) * 0.12, 0.0, 0.22));
-        runtime.floorMaterial.color.copy(floorTint);
-        runtime.floorMaterial.emissive.copy(bounceColor);
-        runtime.floorMaterial.emissiveIntensity = clamp(floorBounce * 0.08, 0.0, 0.22);
+        runtime.floorMaterial.color.copy(floorBaseColor);
+        runtime.floorMaterial.emissive.setRGB(0.0, 0.0, 0.0);
+        runtime.floorMaterial.emissiveIntensity = 0.0;
 
         runtime.floorMaterial.roughness = clamp(
-          0.22 + (1.0 - p.floorSpecular) * 0.58 + p.floorSootRoughness * 0.08 - floorBounce * 0.05,
+          0.22 + (1.0 - p.floorSpecular) * 0.58 + p.floorSootRoughness * 0.08,
           0.12,
           0.98
         );
         runtime.floorMaterial.metalness = clamp(0.01 + p.floorSpecular * 0.22, 0.0, 0.4);
-        runtime.floorMaterial.clearcoat = clamp(0.05 + p.floorSpecular * 0.34 + floorBounce * 0.05, 0.0, 0.82);
-        runtime.floorMaterial.clearcoatRoughness = clamp(0.82 - p.floorSpecular * 0.66 - floorBounce * 0.04, 0.1, 0.95);
-        runtime.floorMaterial.envMapIntensity = clamp(0.55 + p.floorSpecular * 1.05 + floorBounce * 0.36, 0.2, 2.8);
+        runtime.floorMaterial.clearcoat = clamp(0.05 + p.floorSpecular * 0.34, 0.0, 0.82);
+        runtime.floorMaterial.clearcoatRoughness = clamp(0.82 - p.floorSpecular * 0.66, 0.1, 0.95);
+        runtime.floorMaterial.envMapIntensity = clamp(0.55 + p.floorSpecular * 1.05, 0.2, 2.8);
 
-        wallTint.copy(wallBaseColor)
-          .lerp(wallWarmColor, clamp(wallBounce * 0.2, 0.0, 0.28))
-          .lerp(wallHotColor, clamp((wallBounce - 0.4) * 0.12, 0.0, 0.18));
-        runtime.wallMaterial.color.copy(wallTint);
-        runtime.wallMaterial.emissive.copy(fireColor);
-        runtime.wallMaterial.emissiveIntensity = clamp(wallBounce * 0.09, 0.0, 0.2);
-        runtime.wallMaterial.roughness = clamp(0.58 + p.smokeDarkness * 0.28 - wallBounce * 0.04, 0.42, 0.96);
+        runtime.wallMaterial.color.copy(wallBaseColor);
+        runtime.wallMaterial.emissive.setRGB(0.0, 0.0, 0.0);
+        runtime.wallMaterial.emissiveIntensity = 0.0;
+        runtime.wallMaterial.roughness = clamp(0.58 + p.smokeDarkness * 0.28, 0.42, 0.96);
         runtime.wallMaterial.metalness = clamp(0.02 + p.floorSpecular * 0.05, 0.0, 0.16);
 
         updateWoodCombustionSystem(runtime, p, sceneRef.current, logCharSideColor, logCharCapColor);
@@ -4075,8 +4044,8 @@ const FluidSimulation: React.FC = () => {
 const copyParamsToClipboard = useCallback(() => {
     const cpuUniformWriter = `// CPU-side SimParams uniform packing (DataView, little-endian)
 // NOTE: WGSL uses vec4f for cameraPos/targetPos to avoid vec3 padding traps.
-// Buffer size in this app: 384 bytes (fields used up through byte 380).
-const uniformData = new ArrayBuffer(384);
+// Buffer size in this app: 288 bytes (fields used up through byte 284).
+const uniformData = new ArrayBuffer(288);
 const view = new DataView(uniformData);
 const f32 = (byteOff: number, v: number) => view.setFloat32(byteOff, v, true);
 
@@ -4162,14 +4131,6 @@ f32(272, debugOverlayMode);
 f32(276, occlusionMode);
 f32(280, rayStepBudget);
 f32(284, occlusionStepBudget);
-
-// Fire proxy lights @ 288
-f32(288, fireLight0Pos.x); f32(292, fireLight0Pos.y); f32(296, fireLight0Pos.z); f32(300, fireLight0Range);
-f32(304, fireLight0Color.r); f32(308, fireLight0Color.g); f32(312, fireLight0Color.b); f32(316, fireLight0Intensity);
-f32(320, fireLight1Pos.x); f32(324, fireLight1Pos.y); f32(328, fireLight1Pos.z); f32(332, fireLight1Range);
-f32(336, fireLight1Color.r); f32(340, fireLight1Color.g); f32(344, fireLight1Color.b); f32(348, fireLight1Intensity);
-f32(352, fireLight2Pos.x); f32(356, fireLight2Pos.y); f32(360, fireLight2Pos.z); f32(364, fireLight2Range);
-f32(368, fireLight2Color.r); f32(372, fireLight2Color.g); f32(376, fireLight2Color.b); f32(380, fireLight2Intensity);
 `;
 
     const payload = {

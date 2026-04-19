@@ -342,7 +342,7 @@ export const startFireVolumeSystem = <TTransport extends FireVolumeTransport, TP
         const activeQuality = refs.qualityModeRef.current;
         const useHalfResFirePass = activeQuality === 'realtime';
         const budget = QUALITY_BUDGETS[activeQuality];
-        const qualityBoost = activeQuality === 'accurate' ? 1.15 : 1.0;
+        const qualityBoost = 1.0;
         const adaptiveScale = activeQuality === 'accurate' ? 1.0 : refs.adaptiveStepScaleRef.current;
         const stepQuality = clamp(refs.paramsRef.current.stepQuality * qualityBoost * adaptiveScale, 0.25, 4.0);
         const rayStepBudget = Math.max(24, Math.round(budget.rayStepBudget * (activeQuality === 'accurate' ? 1.0 : adaptiveScale)));
@@ -358,9 +358,9 @@ export const startFireVolumeSystem = <TTransport extends FireVolumeTransport, TP
         // actually hit the frame budget on slower GPUs / larger grids.
         const jacobiIterations =
           activeQuality === 'accurate'
-            ? (transport.dim >= 192 ? 8 : 10)
+            ? (transport.dim >= 192 ? 6 : 8)
             : activeQuality === 'realtime'
-              ? clamp(Math.round(6 * adaptiveScale), 2, 6)
+              ? clamp(Math.round(5 * adaptiveScale), 2, 5)
               : 6;
 
         if (!loggedOcclusionNote) {
@@ -756,7 +756,7 @@ export const startFireVolumeSystem = <TTransport extends FireVolumeTransport, TP
 
         let worldMsThisFrame = 0;
         if (refs.worldNeedsRenderRef.current && refs.renderWorldRef.current) {
-          const worldRenderIntervalMs = activeQuality === 'accurate' ? 33 : 50;
+          const worldRenderIntervalMs = activeQuality === 'accurate' ? 50 : 66;
           const worldRenderDue = now - lastWorldRenderAtMs >= worldRenderIntervalMs;
           if (refs.compositionModeRef.current !== 'fire_only' && worldRenderDue) {
             worldMsThisFrame = refs.renderWorldRef.current();
