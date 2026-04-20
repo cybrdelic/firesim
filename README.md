@@ -76,7 +76,10 @@ Detailed limits and edge-case notes are documented in [STABILITY.md](STABILITY.m
 ```
 firesim/
 ├── components/
-│   ├── FluidSimulation.tsx   # Main control deck, world scene, presets, and fire runtime wiring
+│   ├── FluidSimulation.tsx   # Main runtime host that can mount as different consumers
+│   ├── fireRuntime/
+│   │   ├── consumers.ts      # Consumer definitions for control deck, 3D scene, hero, cursor, ambient
+│   │   └── transport.ts      # Reusable GPU transport/buffer contract extracted from the app shell
 │   ├── fluid/
 │   │   ├── assetSystem.ts    # Scanned/procedural log asset loading
 │   │   ├── debugConfig.ts    # Quality, composition, and debug mode mappings
@@ -85,10 +88,22 @@ firesim/
 │   └── TooltipLayer.tsx      # Global tooltip surface for deck controls
 ├── tests/stability/         # Playwright fuzz + snapshot stability harness
 ├── webgpu.d.ts              # Local WebGPU DOM typing surface for this project
-├── App.tsx                  # Main application component
+├── App.tsx                  # Consumer gallery that remounts the runtime in multiple host shells
 ├── types.ts                 # TypeScript type definitions
 └── index.css                # Deck styling
 ```
+
+## 🔌 Runtime Consumers
+
+The app now includes a consumer gallery that exercises the same fire runtime in five host shapes:
+
+- `Control Deck` - the full authoring/debug product
+- `3D Scene Embed` - a minimal scene-mounted runtime surface
+- `2D Site Hero` - a branded hero/background presentation
+- `Cursor Effect` - a lighter fire-only interactive effect shell
+- `Ambient Background` - a low-UI background/idle consumer
+
+This is the first extraction pass toward making FireSim behave more like a reusable runtime than a single hardcoded app shell.
 
 ## 🎯 How It Works
 

@@ -27,6 +27,11 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three/webgpu';
 import { RectAreaLightTexturesLib } from 'three/examples/jsm/lights/RectAreaLightTexturesLib.js';
 import {
+    FIRE_RUNTIME_CONSUMER_MAP,
+    type FireRuntimeConsumerId,
+} from './fireRuntime/consumers';
+import { FluidTransport } from './fireRuntime/transport';
+import {
     addCampfireLogPile,
     WOOD_ASSET_STATE_LABELS,
     type WoodAssetState,
@@ -52,421 +57,6 @@ import {
     WOOD_PILE_DESCRIPTOR,
     type WoodCombustionLogState,
 } from './fluid/woodSystem';
-
-/**
- * SECTION 1: TRANSPORT LAYER (3D)
- */
-
-class ShaderContract {
-  public layout: GPUPipelineLayout;
-  public bindGroupLayout: GPUBindGroupLayout;
-
-  constructor(device: GPUDevice, label: string, entries: any[]) {
-    this.bindGroupLayout = device.createBindGroupLayout({
-      entries,
-      label: `${label}_BGL`
-    });
-
-    this.layout = device.createPipelineLayout({
-      bindGroupLayouts: [this.bindGroupLayout],
-      label: `${label}_PL`
-    });
-  }
-
-  createBindGroup(device: GPUDevice, label: string, entries: any[]): GPUBindGroup {
-    return device.createBindGroup({
-      layout: this.bindGroupLayout,
-      entries,
-      label: `${label}_BG`
-    });
-  }
-}
-
-class FluidTransport {
-  public uniformBuffer: GPUBuffer;
-
-  private uniformStaging: ArrayBuffer;
-  private uniformView: DataView;
-
-  public densityA: GPUBuffer;
-  public densityB: GPUBuffer;
-  public fuelA: GPUBuffer;
-  public fuelB: GPUBuffer;
-  public sootA: GPUBuffer;
-  public sootB: GPUBuffer;
-  public velocityA: GPUBuffer;
-  public velocityB: GPUBuffer;
-  public velocityScratch: GPUBuffer;
-  public divergence: GPUBuffer;
-  public pressureA: GPUBuffer;
-  public pressureB: GPUBuffer;
-  public occupancy: GPUBuffer;
-  public rayStepCounter: GPUBuffer;
-  public velocityBufferSize: number;
-  public macrocellsPerAxis: number;
-
-  public physicsContract!: ShaderContract;
-  public renderContract!: ShaderContract;
-  public projectionDivContract!: ShaderContract;
-  public projectionJacobiContract!: ShaderContract;
-  public projectionGradContract!: ShaderContract;
-  public occupancyContract!: ShaderContract;
-
-  public physicsGroups: GPUBindGroup[] = [];
-  public renderGroups: GPUBindGroup[] = [];
-  public projectionDivGroups: GPUBindGroup[] = [];
-  public projectionJacobiGroups: GPUBindGroup[] = [];
-  public projectionGradGroups: GPUBindGroup[][] = [[], []];
-  public occupancyGroups: GPUBindGroup[] = [];
-
-  constructor(
-    private device: GPUDevice,
-    public dim: number
-  ) {
-    const VOXEL_COUNT = dim * dim * dim;
-
-    this.uniformBuffer = device.createBuffer({
-      size: 288,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-    });
-
-    this.uniformStaging = new ArrayBuffer(288);
-    this.uniformView = new DataView(this.uniformStaging);
-
-    const bufferUsage = (window as any).GPUBufferUsage;
-    const storageUsage = bufferUsage.STORAGE | bufferUsage.COPY_DST | bufferUsage.COPY_SRC;
-
-    this.densityA = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
-    this.densityB = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
-
-    this.fuelA = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
-    this.fuelB = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
-
-    this.sootA = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
-    this.sootB = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
-
-    this.velocityBufferSize = VOXEL_COUNT * 16;
-    this.velocityA = device.createBuffer({ size: this.velocityBufferSize, usage: storageUsage });
-    this.velocityB = device.createBuffer({ size: this.velocityBufferSize, usage: storageUsage });
-    this.velocityScratch = device.createBuffer({ size: this.velocityBufferSize, usage: storageUsage });
-    this.divergence = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
-    this.pressureA = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
-    this.pressureB = device.createBuffer({ size: VOXEL_COUNT * 4, usage: storageUsage });
-
-    // Task C: Macrocell occupancy grid (8 voxels per macrocell per axis)
-    const MACROCELL_SIZE = 8;
-    this.macrocellsPerAxis = Math.ceil(dim / MACROCELL_SIZE);
-    const macrocellCount = this.macrocellsPerAxis ** 3;
-    this.occupancy = device.createBuffer({ size: macrocellCount * 4, usage: storageUsage });
-    device.queue.writeBuffer(this.occupancy, 0, new Uint32Array(macrocellCount));
-
-    // Task B: Ray step counter (single atomic u32)
-    this.rayStepCounter = device.createBuffer({ size: 4, usage: storageUsage });
-
-    const zeroF32 = new Float32Array(VOXEL_COUNT);
-    // Initialize velocity.w = oxygen = 1.0 (fully oxygenated atmosphere)
-    const initVec4 = new Float32Array(VOXEL_COUNT * 4);
-    for (let i = 0; i < VOXEL_COUNT; i++) {
-      initVec4[i * 4 + 3] = 1.0; // .w = oxygen
-    }
-
-    device.queue.writeBuffer(this.densityA, 0, zeroF32);
-    device.queue.writeBuffer(this.densityB, 0, zeroF32);
-    device.queue.writeBuffer(this.fuelA, 0, zeroF32);
-    device.queue.writeBuffer(this.fuelB, 0, zeroF32);
-    device.queue.writeBuffer(this.sootA, 0, zeroF32);
-    device.queue.writeBuffer(this.sootB, 0, zeroF32);
-    device.queue.writeBuffer(this.velocityA, 0, initVec4);
-    device.queue.writeBuffer(this.velocityB, 0, initVec4);
-    device.queue.writeBuffer(this.velocityScratch, 0, initVec4);
-    device.queue.writeBuffer(this.divergence, 0, zeroF32);
-    device.queue.writeBuffer(this.pressureA, 0, zeroF32);
-    device.queue.writeBuffer(this.pressureB, 0, zeroF32);
-    this.initContracts();
-    this.initBindGroups();
-  }
-
-  private initContracts() {
-    this.physicsContract = new ShaderContract(this.device, 'Physics', [
-      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-      { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    ]);
-
-    this.renderContract = new ShaderContract(this.device, 'Render', [
-      { binding: 0, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
-      { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-      { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-      { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-      { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-      { binding: 5, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-      { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'storage' } },
-    ]);
-
-    // Task C: Occupancy compute contract
-    this.occupancyContract = new ShaderContract(this.device, 'Occupancy', [
-      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    ]);
-
-    this.projectionDivContract = new ShaderContract(this.device, 'ProjectionDiv', [
-      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    ]);
-
-    this.projectionJacobiContract = new ShaderContract(this.device, 'ProjectionJacobi', [
-      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    ]);
-
-    this.projectionGradContract = new ShaderContract(this.device, 'ProjectionGrad', [
-      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    ]);
-  }
-
-  private initBindGroups() {
-    this.physicsGroups[0] = this.physicsContract.createBindGroup(this.device, 'Phys0', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.densityA } },
-      { binding: 2, resource: { buffer: this.densityB } },
-      { binding: 3, resource: { buffer: this.velocityA } },
-      { binding: 4, resource: { buffer: this.velocityB } },
-      { binding: 5, resource: { buffer: this.fuelA } },
-      { binding: 6, resource: { buffer: this.fuelB } },
-      { binding: 7, resource: { buffer: this.sootA } },
-      { binding: 8, resource: { buffer: this.sootB } },
-    ]);
-
-    this.renderGroups[0] = this.renderContract.createBindGroup(this.device, 'Render0', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.densityB } },
-      { binding: 2, resource: { buffer: this.velocityB } },
-      { binding: 3, resource: { buffer: this.fuelB } },
-      { binding: 4, resource: { buffer: this.sootB } },
-      { binding: 5, resource: { buffer: this.occupancy } },
-      { binding: 6, resource: { buffer: this.rayStepCounter } },
-    ]);
-
-    this.physicsGroups[1] = this.physicsContract.createBindGroup(this.device, 'Phys1', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.densityB } },
-      { binding: 2, resource: { buffer: this.densityA } },
-      { binding: 3, resource: { buffer: this.velocityB } },
-      { binding: 4, resource: { buffer: this.velocityA } },
-      { binding: 5, resource: { buffer: this.fuelB } },
-      { binding: 6, resource: { buffer: this.fuelA } },
-      { binding: 7, resource: { buffer: this.sootB } },
-      { binding: 8, resource: { buffer: this.sootA } },
-    ]);
-
-    this.renderGroups[1] = this.renderContract.createBindGroup(this.device, 'Render1', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.densityA } },
-      { binding: 2, resource: { buffer: this.velocityA } },
-      { binding: 3, resource: { buffer: this.fuelA } },
-      { binding: 4, resource: { buffer: this.sootA } },
-      { binding: 5, resource: { buffer: this.occupancy } },
-      { binding: 6, resource: { buffer: this.rayStepCounter } },
-    ]);
-
-    // Task C: Occupancy bind groups (match render group buffer selection)
-    this.occupancyGroups[0] = this.occupancyContract.createBindGroup(this.device, 'Occupancy0', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.densityB } },
-      { binding: 2, resource: { buffer: this.fuelB } },
-      { binding: 3, resource: { buffer: this.sootB } },
-      { binding: 4, resource: { buffer: this.occupancy } },
-    ]);
-    this.occupancyGroups[1] = this.occupancyContract.createBindGroup(this.device, 'Occupancy1', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.densityA } },
-      { binding: 2, resource: { buffer: this.fuelA } },
-      { binding: 3, resource: { buffer: this.sootA } },
-      { binding: 4, resource: { buffer: this.occupancy } },
-    ]);
-
-    this.projectionDivGroups[0] = this.projectionDivContract.createBindGroup(this.device, 'ProjectionDiv0', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.velocityB } },
-      { binding: 2, resource: { buffer: this.divergence } },
-    ]);
-
-    this.projectionDivGroups[1] = this.projectionDivContract.createBindGroup(this.device, 'ProjectionDiv1', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.velocityA } },
-      { binding: 2, resource: { buffer: this.divergence } },
-    ]);
-
-    this.projectionJacobiGroups[0] = this.projectionJacobiContract.createBindGroup(this.device, 'ProjectionJacobiA2B', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.divergence } },
-      { binding: 2, resource: { buffer: this.pressureA } },
-      { binding: 3, resource: { buffer: this.pressureB } },
-    ]);
-
-    this.projectionJacobiGroups[1] = this.projectionJacobiContract.createBindGroup(this.device, 'ProjectionJacobiB2A', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.divergence } },
-      { binding: 2, resource: { buffer: this.pressureB } },
-      { binding: 3, resource: { buffer: this.pressureA } },
-    ]);
-
-    this.projectionGradGroups[0][0] = this.projectionGradContract.createBindGroup(this.device, 'ProjectionGrad0PressureA', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.velocityScratch } },
-      { binding: 2, resource: { buffer: this.pressureA } },
-      { binding: 3, resource: { buffer: this.velocityB } },
-    ]);
-
-    this.projectionGradGroups[0][1] = this.projectionGradContract.createBindGroup(this.device, 'ProjectionGrad0PressureB', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.velocityScratch } },
-      { binding: 2, resource: { buffer: this.pressureB } },
-      { binding: 3, resource: { buffer: this.velocityB } },
-    ]);
-
-    this.projectionGradGroups[1][0] = this.projectionGradContract.createBindGroup(this.device, 'ProjectionGrad1PressureA', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.velocityScratch } },
-      { binding: 2, resource: { buffer: this.pressureA } },
-      { binding: 3, resource: { buffer: this.velocityA } },
-    ]);
-
-    this.projectionGradGroups[1][1] = this.projectionGradContract.createBindGroup(this.device, 'ProjectionGrad1PressureB', [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.velocityScratch } },
-      { binding: 2, resource: { buffer: this.pressureB } },
-      { binding: 3, resource: { buffer: this.velocityA } },
-    ]);
-  }
-
-  public updateUniforms(
-    now: number,
-    params: any,
-    camera: { pos: number[], target: number[] },
-    sceneType: number
-  ) {
-    const view = this.uniformView;
-
-    view.setFloat32(0, this.dim, true);
-    view.setFloat32(4, now / 1000.0, true);
-    view.setFloat32(8, params.timeStep, true);
-    view.setFloat32(12, params.vorticity, true);
-
-    view.setFloat32(16, params.dissipation, true);
-    view.setFloat32(20, params.buoyancy, true);
-    view.setFloat32(24, params.drag, true);
-    view.setFloat32(28, params.emission, true);
-
-    view.setFloat32(32, params.exposure, true);
-    view.setFloat32(36, params.gamma, true);
-    view.setFloat32(40, sceneType, true);
-    view.setFloat32(44, params.scattering, true);
-
-    view.setFloat32(48, params.absorption, true);
-    view.setFloat32(52, params.smokeWeight, true);
-    view.setFloat32(56, params.plumeTurbulence, true);
-    view.setFloat32(60, params.smokeDissipation, true);
-
-    view.setFloat32(64, camera.pos[0], true);
-    view.setFloat32(68, camera.pos[1], true);
-    view.setFloat32(72, camera.pos[2], true);
-    view.setFloat32(76, 0, true); // cameraPos.w
-
-    view.setFloat32(80, camera.target[0], true);
-    view.setFloat32(84, camera.target[1], true);
-    view.setFloat32(88, camera.target[2], true);
-    view.setFloat32(92, 0, true); // targetPos.w
-
-    view.setFloat32(96, params.windX || 0, true);
-    view.setFloat32(100, params.windZ || 0, true);
-    view.setFloat32(104, params.turbFreq || 28.0, true);
-    view.setFloat32(108, params.turbSpeed || 1.0, true);
-    view.setFloat32(112, params.fuelEfficiency || 1.0, true);
-    view.setFloat32(116, params.heatDiffusion || 0.0, true);
-    view.setFloat32(120, params.stepQuality || 1.0, true);
-    view.setFloat32(124, 0.0, true); // pad4
-
-    // Extended combustion + smoke taxonomy + rendering controls.
-    const fuelEff = params.fuelEfficiency || 1.0;
-    const heightFactor = clamp(params.buoyancy / 8.0, 0.5, 5.0);
-    const baseBurnRate = params.burnRate ?? fuelEff * 6.0;
-    const baseFuelInject = params.fuelInject ?? (0.4 + fuelEff * 0.6);
-    const derivedBurnRate = baseBurnRate / heightFactor;
-    const derivedFuelInject = baseFuelInject * heightFactor;
-    const derivedVolumeHeight = params.volumeHeight ?? 1.0;
-    view.setFloat32(128, params.T_ignite ?? 0.18, true);
-    view.setFloat32(132, params.T_burn ?? 0.55, true);
-    view.setFloat32(136, derivedBurnRate, true);
-    view.setFloat32(140, derivedFuelInject, true);
-
-    view.setFloat32(144, params.heatYield ?? 3.4, true);
-    view.setFloat32(148, params.sootYieldFlame ?? 0.55, true);
-    view.setFloat32(152, params.sootYieldSmolder ?? 1.1, true);
-    view.setFloat32(156, params.hazeConvertRate ?? 0.0, true);
-
-    view.setFloat32(160, params.T_hazeStart ?? 0.35, true);
-    view.setFloat32(164, params.T_hazeFull ?? 0.75, true);
-    view.setFloat32(168, params.anisotropyG ?? 0.82, true);
-    view.setFloat32(172, params.smokeThickness ?? 1.0, true);
-
-    view.setFloat32(176, params.smokeDarkness ?? 0.65, true);
-    view.setFloat32(180, params.flameSharpness ?? 4.0, true);
-    view.setFloat32(184, params.sootDissipation ?? params.smokeDissipation ?? 0.985, true);
-    view.setFloat32(188, derivedVolumeHeight, true);
-
-    // Floor + scene lighting controls.
-    view.setFloat32(192, params.floorUvScale ?? 1.35, true);
-    view.setFloat32(196, params.floorUvWarp ?? 1.2, true);
-    view.setFloat32(200, params.floorBlendStrength ?? 0.85, true);
-    view.setFloat32(204, params.floorNormalStrength ?? 1.05, true);
-
-    view.setFloat32(208, params.floorMicroStrength ?? 0.55, true);
-    view.setFloat32(212, params.floorSootDarkening ?? 1.25, true);
-    view.setFloat32(216, params.floorSootRoughness ?? 1.1, true);
-    view.setFloat32(220, params.floorCharStrength ?? 1.2, true);
-
-    view.setFloat32(224, params.floorContactShadow ?? 1.0, true);
-    view.setFloat32(228, params.floorSpecular ?? 1.1, true);
-    view.setFloat32(232, params.floorFireBounce ?? 1.7, true);
-    view.setFloat32(236, params.floorAmbient ?? 0.55, true);
-
-    view.setFloat32(240, params.lightingFireIntensity ?? 1.75, true);
-    view.setFloat32(244, params.lightingFireFalloff ?? 1.1, true);
-    view.setFloat32(248, params.lightingFlicker ?? 0.2, true);
-    view.setFloat32(252, params.lightingGlow ?? 1.35, true);
-
-    const viewportWidth = Math.max(1, Number(params.renderWidth ?? window.innerWidth));
-    const viewportHeight = Math.max(1, Number(params.renderHeight ?? window.innerHeight));
-    const cameraAspect = viewportWidth / viewportHeight;
-    const cameraTanHalfFov = Math.tan((90.0 * Math.PI / 180.0) * 0.5);
-    view.setFloat32(256, viewportWidth, true);
-    view.setFloat32(260, viewportHeight, true);
-    view.setFloat32(264, cameraAspect, true);
-    view.setFloat32(268, cameraTanHalfFov, true);
-    view.setFloat32(272, params.debugOverlayMode ?? 0.0, true);
-    view.setFloat32(276, params.occlusionMode ?? 1.0, true);
-    view.setFloat32(280, params.rayStepBudget ?? 160.0, true);
-    view.setFloat32(284, params.occlusionStepBudget ?? 80.0, true);
-
-    this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformStaging);
-  }
-}
 
 /**
  * SECTION 2: THE WGSL SHADERS
@@ -3029,18 +2619,30 @@ type FireSimHarnessConfig = {
   maxFrames: number | null;
 };
 
-const FluidSimulation: React.FC = () => {
+type FluidSimulationProps = {
+  consumerId?: FireRuntimeConsumerId;
+  className?: string;
+};
+
+const FluidSimulation: React.FC<FluidSimulationProps> = ({
+  consumerId = 'control-deck',
+  className,
+}) => {
+  const consumer = FIRE_RUNTIME_CONSUMER_MAP[consumerId];
+  const initialSceneParams = SCENES.find((scene) => scene.id === consumer.initialSceneId)?.params ?? SCENES[0].params;
+  const initialSimParams = { ...INITIAL_PARAMS, ...initialSceneParams };
+  const rootRef = useRef<HTMLDivElement>(null);
   const worldCanvasRef = useRef<HTMLCanvasElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const worldRuntimeRef = useRef<WorldRuntime | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [error, setError] = useState<string | null>(null);
-  const [controlsVisible, setControlsVisible] = useState(true);
+  const [controlsVisible, setControlsVisible] = useState(consumer.showControlsPanel);
   const [isPlaying, setIsPlaying] = useState(true);
-  const [isSmokeEnabled, setIsSmokeEnabled] = useState(true);
-  const [qualityMode, setQualityMode] = useState<QualityMode>('accurate');
+  const [isSmokeEnabled, setIsSmokeEnabled] = useState(consumer.initialSmokeEnabled);
+  const [qualityMode, setQualityMode] = useState<QualityMode>(consumer.initialQualityMode);
   const [diagnosticsTab, setDiagnosticsTab] = useState<DiagnosticsTab>('runtime');
-  const [compositionMode, setCompositionMode] = useState<CompositionDebugMode>('composited');
+  const [compositionMode, setCompositionMode] = useState<CompositionDebugMode>(consumer.initialCompositionMode);
   const [fireOcclusionMode, setFireOcclusionMode] = useState<FireOcclusionMode>('analytic_sdf');
   const [fireOverlayMode, setFireOverlayMode] = useState<FireOverlayMode>('final');
   const [runtimeWarning, setRuntimeWarning] = useState<string | null>(null);
@@ -3068,11 +2670,11 @@ const FluidSimulation: React.FC = () => {
     fieldDivL1: null,
     fieldReactionFraction: null,
   });
-  const [selectedSceneId, setSelectedSceneId] = useState(0);
+  const [selectedSceneId, setSelectedSceneId] = useState(consumer.initialSceneId);
   const [activeSlot, setActiveSlot] = useState<PresetSlot>('A');
   const [presetSlots, setPresetSlots] = useState<Record<PresetSlot, SimParamState>>({
-    A: { ...INITIAL_PARAMS },
-    B: { ...INITIAL_PARAMS },
+    A: { ...initialSimParams },
+    B: { ...initialSimParams },
   });
   const [activeSection, setActiveSection] = useState<ControlSection>('macros');
   const [paramSearch, setParamSearch] = useState('');
@@ -3084,7 +2686,15 @@ const FluidSimulation: React.FC = () => {
     optics: false,
   });
   const readPixelRatio = () => Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
-  const [dimensions, setDimensions] = useState({ width: window.innerWidth, height: window.innerHeight, pixelRatio: readPixelRatio() });
+  const readContainerDimensions = useCallback(() => {
+    const host = rootRef.current;
+    return {
+      width: Math.max(1, Math.round(host?.clientWidth ?? window.innerWidth)),
+      height: Math.max(1, Math.round(host?.clientHeight ?? window.innerHeight)),
+      pixelRatio: readPixelRatio(),
+    };
+  }, []);
+  const [dimensions, setDimensions] = useState(readContainerDimensions);
 
   const readInitialGridSize = () => {
     try {
@@ -3101,8 +2711,8 @@ const FluidSimulation: React.FC = () => {
   };
 
   const [gridSize, setGridSize] = useState(readInitialGridSize);
-  const [runtimeResolutionScale, setRuntimeResolutionScale] = useState(0.9);
-  const [simParams, setSimParams] = useState<SimParamState>({ ...INITIAL_PARAMS });
+  const [runtimeResolutionScale, setRuntimeResolutionScale] = useState(consumer.initialResolutionScale);
+  const [simParams, setSimParams] = useState<SimParamState>({ ...initialSimParams });
   const [lockedParams, setLockedParams] = useState<Record<EditableParamKey, boolean>>(() => (
     Object.fromEntries(PARAM_SPECS.map((spec) => [spec.key, false])) as Record<EditableParamKey, boolean>
   ));
@@ -3111,8 +2721,8 @@ const FluidSimulation: React.FC = () => {
   const deriveTurbulenceCharacterT = (params: Pick<SimParamState, 'plumeTurbulence'>) => clamp(inverseLerp(0.1, 14, params.plumeTurbulence), 0, 1);
 
   const [tuningMacroKnobs, setTuningMacroKnobs] = useState(() => ({
-    smokeAmount: deriveSmokeAmountT(INITIAL_PARAMS),
-    turbulenceCharacter: deriveTurbulenceCharacterT(INITIAL_PARAMS),
+    smokeAmount: deriveSmokeAmountT(initialSimParams),
+    turbulenceCharacter: deriveTurbulenceCharacterT(initialSimParams),
   }));
   const renderScale = useMemo(
     () => clamp(getRenderScale(dimensions.width, dimensions.height, dimensions.pixelRatio) * runtimeResolutionScale, 0.35, 1.0),
@@ -3173,6 +2783,34 @@ const FluidSimulation: React.FC = () => {
     worldNeedsRenderRef.current = true;
   }, []);
 
+  useEffect(() => {
+    const host = rootRef.current;
+    if (!host) return;
+
+    const updateDimensions = () => {
+      setDimensions((prev) => {
+        const next = readContainerDimensions();
+        if (
+          prev.width === next.width &&
+          prev.height === next.height &&
+          prev.pixelRatio === next.pixelRatio
+        ) {
+          return prev;
+        }
+        return next;
+      });
+    };
+
+    updateDimensions();
+    const resizeObserver = new ResizeObserver(updateDimensions);
+    resizeObserver.observe(host);
+    window.addEventListener('resize', updateDimensions);
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener('resize', updateDimensions);
+    };
+  }, [readContainerDimensions]);
+
   useEffect(() => { paramsRef.current = simParams; }, [simParams]);
   useEffect(() => { playingRef.current = isPlaying; }, [isPlaying]);
   useEffect(() => { sceneRef.current = selectedSceneId; }, [selectedSceneId]);
@@ -3185,10 +2823,12 @@ const FluidSimulation: React.FC = () => {
     const runtime = worldRuntimeRef.current;
     if (!runtime) return;
     const targetPixelRatio = Math.min(window.devicePixelRatio || 1, qualityMode === 'accurate' ? 0.95 : 0.85);
+    runtime.camera.aspect = dimensions.width / Math.max(1, dimensions.height);
+    runtime.camera.updateProjectionMatrix();
     runtime.renderer.setPixelRatio(targetPixelRatio);
-    runtime.renderer.setSize(window.innerWidth, window.innerHeight, false);
+    runtime.renderer.setSize(dimensions.width, dimensions.height, false);
     markWorldDirty();
-  }, [markWorldDirty, qualityMode]);
+  }, [dimensions.height, dimensions.width, markWorldDirty, qualityMode]);
   useEffect(() => { markWorldDirty(); }, [markWorldDirty, simParams, compositionMode, dimensions.width, dimensions.height, dimensions.pixelRatio]);
 
   useEffect(() => {
@@ -3274,11 +2914,6 @@ const FluidSimulation: React.FC = () => {
   const copyRuntimeLogToClipboard = useCallback(() => {
     void copyText(getRuntimeLogText(), 'Copied runtime log');
   }, [copyText, getRuntimeLogText]);
-
-  useEffect(() => {
-    const handleResize = () => setDimensions({ width: window.innerWidth, height: window.innerHeight, pixelRatio: readPixelRatio() });
-    window.addEventListener('resize', handleResize); return () => window.removeEventListener('resize', handleResize);
-  }, []);
 
   const handleSceneChange = useCallback((id: number) => {
     setSelectedSceneId(id);
@@ -3630,7 +3265,6 @@ const FluidSimulation: React.FC = () => {
     if (!canvas || !navigator.gpu) return;
 
     let destroyed = false;
-    let removeResize = () => {};
 
     const initWorld = async () => {
       const getWorldPixelRatio = () => Math.min(window.devicePixelRatio || 1, qualityModeRef.current === 'accurate' ? 0.9 : 0.8);
@@ -3646,7 +3280,7 @@ const FluidSimulation: React.FC = () => {
       }
 
       renderer.setPixelRatio(getWorldPixelRatio());
-      renderer.setSize(window.innerWidth, window.innerHeight, false);
+      renderer.setSize(dimensions.width, dimensions.height, false);
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
       renderer.toneMappingExposure = 1.0;
@@ -3671,7 +3305,7 @@ const FluidSimulation: React.FC = () => {
 
       const camera = new THREE.PerspectiveCamera(
         90,
-        window.innerWidth / Math.max(1, window.innerHeight),
+        dimensions.width / Math.max(1, dimensions.height),
         0.02,
         120
       );
@@ -3835,19 +3469,6 @@ const FluidSimulation: React.FC = () => {
         logLastUpdateMs: performance.now(),
         lastWorldRenderMs: 0,
       };
-
-      const handleResize = () => {
-        const runtime = worldRuntimeRef.current;
-        if (!runtime) return;
-        const aspect = window.innerWidth / Math.max(1, window.innerHeight);
-        runtime.camera.aspect = aspect;
-        runtime.camera.updateProjectionMatrix();
-        runtime.renderer.setPixelRatio(getWorldPixelRatio());
-        runtime.renderer.setSize(window.innerWidth, window.innerHeight, false);
-        worldNeedsRenderRef.current = true;
-      };
-      window.addEventListener('resize', handleResize);
-      removeResize = () => window.removeEventListener('resize', handleResize);
 
       const renderWorldNow = () => {
         const runtime = worldRuntimeRef.current;
@@ -4023,7 +3644,6 @@ const FluidSimulation: React.FC = () => {
 
     return () => {
       destroyed = true;
-      removeResize();
       renderWorldRef.current = null;
 
       const runtime = worldRuntimeRef.current;
@@ -4914,10 +4534,23 @@ f32(284, occlusionStepBudget);
     windGusts
   ]);
 
+  const rootClassName = useMemo(() => (
+    [
+      'deck-root',
+      `fire-runtime-consumer`,
+      `fire-runtime-consumer--${consumer.id}`,
+      className,
+    ].filter(Boolean).join(' ')
+  ), [className, consumer.id]);
+
   if (error) return <div className="deck-error" role="alert">{error}</div>;
 
   return (
-    <div className="deck-root">
+    <div
+      ref={rootRef}
+      className={rootClassName}
+      data-consumer-id={consumer.id}
+    >
       <canvas
         ref={worldCanvasRef}
         width={Math.max(1, Math.round(dimensions.width * dimensions.pixelRatio))}
@@ -4952,6 +4585,17 @@ f32(284, occlusionStepBudget);
         onChange={loadPresetFromDisk}
       />
 
+      {!consumer.showTopbar && (
+        <div className="fire-runtime-badge deck-panel" aria-label="Consumer runtime summary">
+          <div className="fire-runtime-badge-title">{consumer.label}</div>
+          <div className="fire-runtime-badge-meta">
+            <span>{SCENES.find((scene) => scene.id === selectedSceneId)?.name ?? 'Custom'}</span>
+            <span>{qualityMode === 'accurate' ? 'Accurate' : 'Realtime'}</span>
+          </div>
+        </div>
+      )}
+
+      {consumer.showTopbar && (
       <header className="deck-topbar">
         <div className="deck-topbar-left">
           <Flame size={16} className="deck-brand-icon" />
@@ -5021,7 +4665,9 @@ f32(284, occlusionStepBudget);
           </div>
         </div>
       </header>
+      )}
 
+      {consumer.showControlsPanel && (
       <aside className={`deck-left deck-panel ${controlsVisible ? '' : 'is-hidden'}`} aria-label="Control deck">
         <nav className="deck-left-rail" aria-label="Sections">
           <button type="button" className={`deck-rail-btn ${deckRailSection === 'home' ? 'is-active' : ''}`} aria-label="Tuning" onClick={() => setDeckRailSection('home')}><Flame size={18} /></button>
@@ -5056,7 +4702,9 @@ f32(284, occlusionStepBudget);
           </div>
         </div>
       </aside>
+      )}
 
+      {consumer.showDiagnosticsPanel && (
       <aside className="deck-diagnostics deck-panel" aria-label="Diagnostics">
         <div className="deck-diag-head">
           <span>Diagnostics</span>
@@ -5269,7 +4917,9 @@ f32(284, occlusionStepBudget);
           </div>
         </div>
       </aside>
+      )}
 
+      {consumer.showStatusBar && (
       <footer className="deck-statusbar" aria-label="Status">
         <div className="deck-status-inner">
           <div className="deck-status-item"><Thermometer size={14} /><span>Peak Temp:</span><strong>{tempC} °C</strong></div>
@@ -5279,6 +4929,7 @@ f32(284, occlusionStepBudget);
           <div className="deck-status-item"><Gauge size={14} /><span>Sim Time:</span><strong>{simTimeSeconds.toFixed(1)} s</strong></div>
         </div>
       </footer>
+      )}
 
       {runtimeWarning && (
         <div className="deck-toast deck-panel" role="alert">
@@ -5508,3 +5159,4 @@ const ProfileMeter: React.FC<{
 );
 
 export default FluidSimulation;
+
