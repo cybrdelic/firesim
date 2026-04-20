@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three/webgpu';
+import { RectAreaLightTexturesLib } from 'three/examples/jsm/lights/RectAreaLightTexturesLib.js';
 import {
     addCampfireLogPile,
     WOOD_ASSET_STATE_LABELS,
@@ -1420,10 +1421,13 @@ fn phase_function(costheta: f32, g: f32) -> f32 {
 // Task 14: Calibrated blackbody ramp - reduced peak to prevent blowout
 fn getBlackbodyColor(temp: f32) -> vec3f {
    let t = max(0.0, temp - 0.12);
-   if (t < 0.3) { return mix(vec3f(0.0), vec3f(2.0, 0.04, 0.001), t / 0.3); }
-   else if (t < 0.75) { return mix(vec3f(2.0, 0.04, 0.001), vec3f(5.0, 1.6, 0.08), (t - 0.3) / 0.45); }
-   else if (t < 1.4) { return mix(vec3f(5.0, 1.6, 0.08), vec3f(10.0, 7.0, 1.0), (t - 0.75) / 0.65); }
-   else { return mix(vec3f(10.0, 7.0, 1.0), vec3f(18.0, 16.0, 12.0), clamp((t - 1.4) * 0.4, 0.0, 1.0)); }
+   if (t < 0.3) { return mix(vec3f(0.0), vec3f(1.8, 0.04, 0.001), t / 0.3); }
+   else if (t < 0.75) { return mix(vec3f(1.8, 0.04, 0.001), vec3f(4.8, 1.35, 0.08), (t - 0.3) / 0.45); }
+   else if (t < 1.25) { return mix(vec3f(4.8, 1.35, 0.08), vec3f(8.6, 5.4, 0.7), (t - 0.75) / 0.5); }
+   else {
+     let hot = clamp((t - 1.25) * 0.5, 0.0, 1.0);
+     return mix(vec3f(8.6, 5.4, 0.7), vec3f(11.4, 8.6, 5.0), hot);
+   }
 }
 
 fn get_light_transmittance(pos: vec3f, lightDir: vec3f) -> f32 {
@@ -1685,18 +1689,25 @@ fn intersect_occluders(ro: vec3f, rd: vec3f, minT: f32, maxT: f32, useSdfOcclude
         let sunTrans = cachedSunTrans;
         let sootTint = vec3f(0.10, 0.09, 0.085);
         let hazeTint = vec3f(0.18, 0.18, 0.19);
+        let warmHazeTint = vec3f(0.28, 0.20, 0.14);
         let sootFrac = clamp(sootOpt / max(1e-6, sootOpt + hazeOpt), 0.0, 1.0);
-        let smokeTint = mix(hazeTint, sootTint, sootFrac);
-        let scatterRadiance = vec3f(9.0) * sunTrans * phaseSun * smokeTint;
+        let hazeMix = clamp(hot * (1.0 - sootFrac) * 0.55, 0.0, 0.55);
+        let smokeTint = mix(mix(hazeTint, warmHazeTint, hazeMix), sootTint, sootFrac);
+        let shadowTr = max(0.35, mix(1.0, sunTrans, 0.35));
+        let skyScatter = vec3f(8.0) * sunTrans * phaseSun * smokeTint;
+        let fireScatterColor = mix(vec3f(0.95, 0.34, 0.08), vec3f(1.0, 0.62, 0.24), hot);
+        let fireScatterStrength = params.lightingGlow * shadowTr * (0.05 + reaction * 0.52 + hazeOpt * 0.12);
+        let scatterRadiance = skyScatter + fireScatterColor * fireScatterStrength;
         let scatterWeight = (sigmaS / max(1e-6, sigmaT)) * (1.0 - stepTrans);
         accumCol += scatterRadiance * scatterWeight * transmittance;
 
         // Flame-only emission: reaction emits, soot only attenuates.
         // Apply a *soft* self-shadow (don't zero out emission inside smoke).
-        let shadowTr = max(0.35, mix(1.0, sunTrans, 0.35));
         let microFlame = clamp(1.0 + detail * 0.18, 0.7, 1.3);
-        let reactionEm = reaction * reaction;
-        let emission = getBlackbodyColor(temp) * params.emission * reactionEm * shadowTr * microFlame;
+        let reactionEm = pow(clamp(reaction, 0.0, 1.0), 1.55);
+        let coreCompression = 1.0 / (1.0 + max(0.0, temp - 1.05) * 0.55 + reaction * 0.22);
+        let hotCoreTint = mix(vec3f(1.0), vec3f(1.0, 0.93, 0.78), smoothstep(1.0, 1.6, temp));
+        let emission = getBlackbodyColor(temp) * hotCoreTint * params.emission * reactionEm * shadowTr * microFlame * coreCompression;
         let emissionIntegral = emission * ((1.0 - stepTrans) / max(1e-4, sigmaT));
         accumCol += emissionIntegral * transmittance;
 
@@ -2232,6 +2243,16 @@ const INITIAL_PARAMS: SimParamState = {
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 const lerp = (start: number, end: number, t: number) => start + (end - start) * t;
 const inverseLerp = (start: number, end: number, value: number) => (value - start) / Math.max(1e-9, end - start);
+let rectAreaLightLtcInitialized = false;
+
+const ensureRectAreaLightLtc = () => {
+  if (rectAreaLightLtcInitialized) return;
+  const lightNodeApi = (THREE as typeof THREE & { RectAreaLightNode?: { setLTC: (ltc: unknown) => void } }).RectAreaLightNode;
+  if (!lightNodeApi?.setLTC) return;
+  lightNodeApi.setLTC(RectAreaLightTexturesLib.init());
+  rectAreaLightLtcInitialized = true;
+};
+
 const roundToStep = (value: number, step: number, min = 0) => {
   const safeStep = Math.max(step, 1e-6);
   const next = Math.round((value - min) / safeStep) * safeStep + min;
@@ -2301,9 +2322,11 @@ interface WorldRuntime {
   camera: THREE.PerspectiveCamera;
   floorMaterial: THREE.MeshPhysicalMaterial;
   wallMaterial: THREE.MeshPhysicalMaterial;
-  keyLight: THREE.DirectionalLight;
-  fillLight: THREE.HemisphereLight;
-  fireLight: THREE.PointLight;
+  fireAreaLights: [THREE.RectAreaLight, THREE.RectAreaLight];
+  fireLightProbe: THREE.LightProbe;
+  radianceSampler: FireRadianceSampler;
+  propReceivers: WorldPropReceiver[];
+  projectors: WorldRadianceProjectors;
   textures: THREE.Texture[];
   logSideMaterial?: THREE.MeshPhysicalMaterial;
   logCapMaterial?: THREE.MeshPhysicalMaterial;
@@ -2316,17 +2339,228 @@ interface WorldRuntime {
   lastWorldRenderMs: number;
 }
 
-const addWorldProps = (scene: THREE.Scene) => {
+type FireRadianceField = {
+  valid: boolean;
+  energy: number;
+  color: THREE.Color;
+  lateralBias: number;
+  verticalBias: number;
+  spreadX: number;
+  spreadY: number;
+  coreRatio: number;
+};
+
+type FireRadianceSampler = {
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+  width: number;
+  height: number;
+  lastSampleMs: number;
+  lastField: FireRadianceField;
+};
+
+type WorldPropReceiver = {
+  mesh: THREE.Mesh;
+  material: THREE.MeshPhysicalMaterial;
+  baseColor: THREE.Color;
+  normalHint: THREE.Vector3;
+  projectionGain: number;
+  tintGain: number;
+};
+
+type WorldRadianceProjectors = {
+  floor: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
+  wall: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
+  texture: THREE.Texture;
+};
+
+const createFireRadianceSampler = (width = 24, height = 32): FireRadianceSampler | null => {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+  return {
+    canvas,
+    ctx,
+    width,
+    height,
+    lastSampleMs: -1,
+    lastField: {
+      valid: false,
+      energy: 0,
+      color: new THREE.Color(0xff8a3c),
+      lateralBias: 0,
+      verticalBias: 0,
+      spreadX: 0.22,
+      spreadY: 0.4,
+      coreRatio: 0.4,
+    },
+  };
+};
+
+const createFireProjectionTexture = (size = 128) => {
+  const data = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    const ny = (y + 0.5) / size * 2 - 1;
+    for (let x = 0; x < size; x++) {
+      const nx = (x + 0.5) / size * 2 - 1;
+      const p = (y * size + x) * 4;
+      const radius = Math.sqrt(nx * nx + ny * ny);
+      const stretched = Math.sqrt(nx * nx * 0.85 + ny * ny * 1.35);
+      const alpha = clamp(Math.exp(-stretched * stretched * 3.4) * Math.max(0, 1 - radius * 0.82), 0, 1);
+      const hot = clamp(Math.exp(-radius * radius * 10.0), 0, 1);
+      data[p] = Math.round(255 * (0.55 + hot * 0.45));
+      data[p + 1] = Math.round(255 * (0.42 + hot * 0.58));
+      data[p + 2] = Math.round(255 * (0.28 + hot * 0.72));
+      data[p + 3] = Math.round(255 * alpha);
+    }
+  }
+
+  const texture = new THREE.DataTexture(data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.magFilter = THREE.LinearFilter;
+  texture.minFilter = THREE.LinearFilter;
+  texture.colorSpace = THREE.NoColorSpace;
+  texture.needsUpdate = true;
+  return texture;
+};
+
+const sampleFireRadianceField = (
+  sampler: FireRadianceSampler,
+  sourceCanvas: HTMLCanvasElement | null,
+  nowMs: number,
+  minIntervalMs: number
+): FireRadianceField => {
+  if (!sourceCanvas) return sampler.lastField;
+  if (sampler.lastSampleMs >= 0 && nowMs - sampler.lastSampleMs < minIntervalMs) return sampler.lastField;
+  sampler.lastSampleMs = nowMs;
+
+  const { ctx, width, height } = sampler;
+  ctx.clearRect(0, 0, width, height);
+  ctx.drawImage(sourceCanvas, 0, 0, width, height);
+  const image = ctx.getImageData(0, 0, width, height).data;
+
+  let total = 0;
+  let sumX = 0;
+  let sumY = 0;
+  let sumXX = 0;
+  let sumYY = 0;
+  let left = 0;
+  let right = 0;
+  let top = 0;
+  let bottom = 0;
+  let core = 0;
+  let colorR = 0;
+  let colorG = 0;
+  let colorB = 0;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const index = (y * width + x) * 4;
+      const r = image[index] / 255;
+      const g = image[index + 1] / 255;
+      const b = image[index + 2] / 255;
+      const a = image[index + 3] / 255;
+      const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      const weight = luminance * a;
+      if (weight <= 0.01) continue;
+
+      const nx = (x + 0.5) / width;
+      const ny = (y + 0.5) / height;
+      total += weight;
+      sumX += nx * weight;
+      sumY += ny * weight;
+      sumXX += nx * nx * weight;
+      sumYY += ny * ny * weight;
+      colorR += r * weight;
+      colorG += g * weight;
+      colorB += b * weight;
+      if (nx < 0.5) left += weight;
+      else right += weight;
+      if (ny < 0.5) top += weight;
+      else bottom += weight;
+      if (luminance > 0.55) core += weight;
+    }
+  }
+
+  if (total <= 1e-4) {
+    sampler.lastField = {
+      ...sampler.lastField,
+      valid: false,
+      energy: 0,
+    };
+    return sampler.lastField;
+  }
+
+  const meanX = sumX / total;
+  const meanY = sumY / total;
+  const varX = Math.max(0, sumXX / total - meanX * meanX);
+  const varY = Math.max(0, sumYY / total - meanY * meanY);
+  const nextColor = new THREE.Color(
+    clamp(colorR / total, 0, 1),
+    clamp(colorG / total, 0, 1),
+    clamp(colorB / total, 0, 1)
+  );
+
+  sampler.lastField = {
+    valid: true,
+    energy: clamp(total / 34, 0, 1.8),
+    color: nextColor,
+    lateralBias: clamp((right - left) / total, -1, 1),
+    verticalBias: clamp((bottom - top) / total, -1, 1),
+    spreadX: clamp(Math.sqrt(varX) * 2.8, 0.12, 0.65),
+    spreadY: clamp(Math.sqrt(varY) * 3.1, 0.18, 0.9),
+    coreRatio: clamp(core / total, 0, 1),
+  };
+
+  return sampler.lastField;
+};
+
+const setShColor = (target: THREE.Vector3, color: THREE.Color, scale: number) => {
+  target.set(color.r * scale, color.g * scale, color.b * scale);
+};
+
+const projectFireRadianceAtPoint = (
+  point: THREE.Vector3,
+  normal: THREE.Vector3,
+  emitter: THREE.Vector3,
+  field: FireRadianceField
+) => {
+  const dx = point.x - emitter.x;
+  const dy = point.y - emitter.y;
+  const dz = point.z - emitter.z;
+  const horizontalSpread = 0.24 + field.spreadX * 1.9;
+  const verticalSpread = 0.32 + field.spreadY * 1.7;
+  const depthSpread = 0.28 + field.spreadY * 1.2;
+  const ellipsoid = Math.exp(-(
+    (dx * dx) / Math.max(1e-4, horizontalSpread * horizontalSpread) +
+    (dy * dy) / Math.max(1e-4, verticalSpread * verticalSpread) +
+    (dz * dz) / Math.max(1e-4, depthSpread * depthSpread)
+  ));
+  const toEmitter = new THREE.Vector3(emitter.x - point.x, emitter.y - point.y, emitter.z - point.z);
+  const distanceSq = Math.max(0.04, toEmitter.lengthSq());
+  toEmitter.normalize();
+  const incidence = Math.max(0, normal.dot(toEmitter));
+  return field.energy * ellipsoid * (0.2 + incidence * 0.8) / (1 + distanceSq * 1.35);
+};
+
+const addWorldProps = (scene: THREE.Scene): WorldPropReceiver[] => {
   const baseMaterial = new THREE.MeshPhysicalMaterial({
     color: 0x6e747c,
     roughness: 0.5,
     metalness: 0.08,
+    emissive: 0x000000,
+    emissiveIntensity: 0.0,
   });
 
   const stoneMaterial = new THREE.MeshPhysicalMaterial({
     color: 0x5b6066,
     roughness: 0.88,
     metalness: 0.02,
+    emissive: 0x000000,
+    emissiveIntensity: 0.0,
   });
 
   const reflectiveMaterial = new THREE.MeshPhysicalMaterial({
@@ -2335,6 +2569,8 @@ const addWorldProps = (scene: THREE.Scene) => {
     metalness: 1.0,
     clearcoat: 0.22,
     clearcoatRoughness: 0.12,
+    emissive: 0x000000,
+    emissiveIntensity: 0.0,
   });
 
   const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.16, 48, 48), reflectiveMaterial);
@@ -2354,6 +2590,33 @@ const addWorldProps = (scene: THREE.Scene) => {
   capsule.castShadow = false;
   capsule.receiveShadow = false;
   scene.add(capsule);
+
+  return [
+    {
+      mesh: sphere,
+      material: reflectiveMaterial,
+      baseColor: reflectiveMaterial.color.clone(),
+      normalHint: new THREE.Vector3(-0.2, 0.85, 0.48).normalize(),
+      projectionGain: 1.2,
+      tintGain: 0.08,
+    },
+    {
+      mesh: box,
+      material: stoneMaterial,
+      baseColor: stoneMaterial.color.clone(),
+      normalHint: new THREE.Vector3(0.22, 0.72, 0.66).normalize(),
+      projectionGain: 1.05,
+      tintGain: 0.12,
+    },
+    {
+      mesh: capsule,
+      material: baseMaterial,
+      baseColor: baseMaterial.color.clone(),
+      normalHint: new THREE.Vector3(0.08, 0.92, 0.36).normalize(),
+      projectionGain: 1.15,
+      tintGain: 0.1,
+    },
+  ];
 };
 
 const makeFallbackLogMaterial = () => new THREE.MeshPhysicalMaterial({
@@ -2838,7 +3101,7 @@ const FluidSimulation: React.FC = () => {
   };
 
   const [gridSize, setGridSize] = useState(readInitialGridSize);
-  const [runtimeResolutionScale, setRuntimeResolutionScale] = useState(1);
+  const [runtimeResolutionScale, setRuntimeResolutionScale] = useState(0.9);
   const [simParams, setSimParams] = useState<SimParamState>({ ...INITIAL_PARAMS });
   const [lockedParams, setLockedParams] = useState<Record<EditableParamKey, boolean>>(() => (
     Object.fromEntries(PARAM_SPECS.map((spec) => [spec.key, false])) as Record<EditableParamKey, boolean>
@@ -2921,7 +3184,7 @@ const FluidSimulation: React.FC = () => {
   useEffect(() => {
     const runtime = worldRuntimeRef.current;
     if (!runtime) return;
-    const targetPixelRatio = Math.min(window.devicePixelRatio || 1, qualityMode === 'accurate' ? 1.35 : 1.1);
+    const targetPixelRatio = Math.min(window.devicePixelRatio || 1, qualityMode === 'accurate' ? 0.95 : 0.85);
     runtime.renderer.setPixelRatio(targetPixelRatio);
     runtime.renderer.setSize(window.innerWidth, window.innerHeight, false);
     markWorldDirty();
@@ -3370,7 +3633,7 @@ const FluidSimulation: React.FC = () => {
     let removeResize = () => {};
 
     const initWorld = async () => {
-      const getWorldPixelRatio = () => Math.min(window.devicePixelRatio || 1, qualityModeRef.current === 'accurate' ? 1.35 : 1.1);
+      const getWorldPixelRatio = () => Math.min(window.devicePixelRatio || 1, qualityModeRef.current === 'accurate' ? 0.9 : 0.8);
       const renderer = new THREE.WebGPURenderer({
         canvas,
         antialias: true,
@@ -3388,13 +3651,23 @@ const FluidSimulation: React.FC = () => {
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
       renderer.toneMappingExposure = 1.0;
       renderer.shadowMap.enabled = false;
+      ensureRectAreaLightLtc();
+      const radianceSampler = createFireRadianceSampler() ?? createFireRadianceSampler(16, 24);
+      if (!radianceSampler) {
+        throw new Error('Unable to initialize fire radiance sampler');
+      }
+      const projectionTexture = createFireProjectionTexture();
 
       const scene = new THREE.Scene();
-      const skyDay = new THREE.Color(0x9eb6cc);
-      const skyNight = new THREE.Color(0x111a25);
-      const skyMix = new THREE.Color();
-      scene.background = skyDay.clone();
-      scene.fog = new THREE.Fog(0x9eb6cc, 3.5, 26.0);
+      const skyNight = new THREE.Color(0x10151d);
+      const floorBaseColor = new THREE.Color(0x868b90);
+      const wallBaseColor = new THREE.Color(0x434950);
+      const emberLightColor = new THREE.Color(0xff641f);
+      const flameLightColor = new THREE.Color(0xffa34d);
+      const coreLightColor = new THREE.Color(0xfff0c0);
+      const fireColor = new THREE.Color();
+      scene.background = skyNight.clone();
+      scene.fog = new THREE.Fog(skyNight.getHex(), 3.5, 26.0);
 
       const camera = new THREE.PerspectiveCamera(
         90,
@@ -3403,27 +3676,56 @@ const FluidSimulation: React.FC = () => {
         120
       );
 
-      const keyLight = new THREE.DirectionalLight(0xfff2dd, 2.2);
-      keyLight.position.set(-2.6, 4.8, -1.2);
-      keyLight.castShadow = false;
-      scene.add(keyLight);
+      const fireAreaLightA = new THREE.RectAreaLight(0xff8a3c, 4.0, 0.46, 0.92);
+      fireAreaLightA.position.set(0.5, 0.42, 0.62);
+      fireAreaLightA.lookAt(0.5, 0.38, 0.18);
+      scene.add(fireAreaLightA);
 
-      const fillLight = new THREE.HemisphereLight(0x9fbfe0, 0x2a3038, 0.48);
-      scene.add(fillLight);
+      const fireAreaLightB = new THREE.RectAreaLight(0xff8a3c, 2.8, 0.34, 0.72);
+      fireAreaLightB.position.set(0.82, 0.34, 0.5);
+      fireAreaLightB.lookAt(0.32, 0.34, 0.5);
+      scene.add(fireAreaLightB);
 
-      const fireLight = new THREE.PointLight(0xff8a3c, 3.0, 5.0, 1.8);
-      fireLight.position.set(0.5, 0.22, 0.5);
-      fireLight.castShadow = false;
-      scene.add(fireLight);
+      const fireLightProbe = new THREE.LightProbe(new THREE.SphericalHarmonics3(), 0);
+      scene.add(fireLightProbe);
+
+      const floorProjectorMaterial = new THREE.MeshBasicMaterial({
+        map: projectionTexture,
+        color: 0xff8a3c,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        toneMapped: false,
+        opacity: 0,
+      });
+      const floorProjector = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), floorProjectorMaterial);
+      floorProjector.rotation.x = -Math.PI / 2;
+      floorProjector.position.set(0.5, 0.012, 0.5);
+      scene.add(floorProjector);
+
+      const wallProjectorMaterial = new THREE.MeshBasicMaterial({
+        map: projectionTexture,
+        color: 0xff8a3c,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        toneMapped: false,
+        opacity: 0,
+      });
+      const wallProjector = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), wallProjectorMaterial);
+      wallProjector.position.set(0.5, 1.3, -3.38);
+      scene.add(wallProjector);
 
       const floorGeometry = new THREE.PlaneGeometry(34, 34);
       floorGeometry.rotateX(-Math.PI / 2);
       const floorMaterial = new THREE.MeshPhysicalMaterial({
-        color: 0x868b90,
+        color: floorBaseColor,
         roughness: 0.76,
         metalness: 0.06,
         clearcoat: 0.12,
         clearcoatRoughness: 0.44,
+        emissive: 0x120803,
+        emissiveIntensity: 0.0,
       });
       const floorMesh = new THREE.Mesh(floorGeometry, floorMaterial);
       floorMesh.position.set(0.5, 0.0, 0.5);
@@ -3432,9 +3734,11 @@ const FluidSimulation: React.FC = () => {
       scene.add(floorMesh);
 
       const wallMaterial = new THREE.MeshPhysicalMaterial({
-        color: 0x434950,
+        color: wallBaseColor,
         roughness: 0.78,
         metalness: 0.03,
+        emissive: 0x0d0502,
+        emissiveIntensity: 0.0,
       });
       const wall = new THREE.Mesh(new THREE.PlaneGeometry(24, 8), wallMaterial);
       wall.position.set(0.5, 3.25, -3.4);
@@ -3442,8 +3746,8 @@ const FluidSimulation: React.FC = () => {
       wall.castShadow = false;
       scene.add(wall);
 
-      const textures: THREE.Texture[] = [];
-      addWorldProps(scene);
+      const textures: THREE.Texture[] = [projectionTexture];
+      const propReceivers = addWorldProps(scene);
       const woodFloor = computeWoodPileFloorSnap(WOOD_PILE_DESCRIPTOR, 0.0);
       const logAsset = await addCampfireLogPile({
         scene,
@@ -3511,9 +3815,15 @@ const FluidSimulation: React.FC = () => {
         camera,
         floorMaterial,
         wallMaterial,
-        keyLight,
-        fillLight,
-        fireLight,
+        fireAreaLights: [fireAreaLightA, fireAreaLightB],
+        fireLightProbe,
+        radianceSampler,
+        propReceivers,
+        projectors: {
+          floor: floorProjector,
+          wall: wallProjector,
+          texture: projectionTexture,
+        },
         textures,
         logSideMaterial: logAsset.sideMaterial,
         logCapMaterial: logAsset.capMaterial,
@@ -3549,33 +3859,152 @@ const FluidSimulation: React.FC = () => {
         runtime.camera.lookAt(cam.target[0], cam.target[1], cam.target[2]);
 
         const p = paramsRef.current;
-        const dayBlend = clamp(1.0 - p.lightingFlicker, 0.0, 1.0);
-        skyMix.copy(skyNight).lerp(skyDay, dayBlend);
-        runtime.scene.background = skyMix;
-        (runtime.scene.fog as THREE.Fog).color.copy(skyMix);
+        const fireTime = worldStartMs * 0.001;
+        const flickerBand =
+          Math.sin(fireTime * 6.7) * 0.5 +
+          Math.sin(fireTime * 12.9 + 0.7) * 0.32 +
+          Math.sin(fireTime * 19.7 + 2.1) * 0.18;
+        const flicker = 1.0 + flickerBand * clamp(0.03 + p.lightingFlicker * 0.08, 0.03, 0.11);
+        const fireEnergy = clamp(0.26 + p.emission * 0.09 + p.fuelEfficiency * 0.15 + p.buoyancy * 0.06, 0.4, 1.85);
+        const fireHeat = clamp(fireEnergy * flicker, 0.3, 2.2);
+        const glowReach = clamp(0.4 + p.lightingGlow * 0.35 + p.lightingFireFalloff * 0.18, 0.35, 1.85);
+        const paramFireColor = fireColor.copy(emberLightColor)
+          .lerp(flameLightColor, clamp(0.34 + fireHeat * 0.34, 0.0, 1.0))
+          .lerp(coreLightColor, clamp((fireHeat - 0.85) * 0.45, 0.0, 0.42));
+        const radianceField = sampleFireRadianceField(
+          runtime.radianceSampler,
+          canvasRef.current,
+          worldStartMs,
+          qualityModeRef.current === 'accurate' ? 90 : 120
+        );
+        if (radianceField.valid) {
+          fireColor.copy(paramFireColor).lerp(radianceField.color, 0.7);
+        }
+        runtime.scene.background = skyNight;
+        (runtime.scene.fog as THREE.Fog).color.copy(skyNight);
         runtime.renderer.toneMappingExposure = clamp(p.exposure * 0.95, 0.45, 1.8);
 
-        runtime.keyLight.intensity = clamp(0.9 + p.floorAmbient * 1.8, 0.55, 3.4);
-        runtime.fillLight.intensity = clamp(0.22 + p.floorAmbient * 1.0, 0.12, 1.5);
+        const primaryAreaLight = runtime.fireAreaLights[0];
+        const secondaryAreaLight = runtime.fireAreaLights[1];
+        const measuredEnergy = radianceField.valid ? radianceField.energy : 0;
+        const measuredSpreadX = radianceField.valid ? radianceField.spreadX : 0.22;
+        const measuredSpreadY = radianceField.valid ? radianceField.spreadY : 0.42;
+        const lateralBias = radianceField.valid ? radianceField.lateralBias : 0;
+        const verticalBias = radianceField.valid ? radianceField.verticalBias : 0;
+        const measuredCore = radianceField.valid ? radianceField.coreRatio : 0.4;
+        const emitterPos = new THREE.Vector3(
+          0.5 + lateralBias * 0.08,
+          0.18 + p.volumeHeight * 0.08 + measuredSpreadY * 0.18 + verticalBias * 0.05,
+          0.48 + verticalBias * 0.02
+        );
+        const probe = runtime.fireLightProbe;
+        const probeWarmth = clamp(0.14 + measuredEnergy * 0.18 + measuredCore * 0.08, 0.08, 0.52);
+        const probeLateral = lateralBias * probeWarmth * 0.32;
+        const probeVertical = clamp(0.08 + probeWarmth * (0.65 + verticalBias * 0.22), 0.06, 0.38);
+        probe.sh.zero();
+        setShColor(probe.sh.coefficients[0], fireColor, probeWarmth);
+        setShColor(probe.sh.coefficients[1], fireColor, probeVertical);
+        setShColor(probe.sh.coefficients[2], fireColor, 0.03 + measuredCore * 0.06);
+        setShColor(probe.sh.coefficients[3], fireColor, probeLateral);
+        probe.intensity = clamp(0.35 + measuredEnergy * 1.15 + measuredSpreadY * 0.35, 0.25, 2.8);
+        const flameHeight = clamp(0.5 + p.volumeHeight * 0.22 + measuredSpreadY * 0.42 + glowReach * 0.04, 0.42, 0.98);
+        const flameWidth = clamp(0.2 + measuredSpreadX * 0.38 + p.lightingGlow * 0.03, 0.18, 0.52);
+        const sideWidth = clamp(flameWidth * (0.58 + measuredCore * 0.22), 0.16, 0.36);
+        primaryAreaLight.position.set(0.5 + lateralBias * 0.07, 0.2 + flameHeight * 0.48 + verticalBias * 0.04, 0.62);
+        primaryAreaLight.width = flameWidth;
+        primaryAreaLight.height = flameHeight;
+        primaryAreaLight.color.copy(fireColor);
+        primaryAreaLight.intensity = clamp(1.9 + fireHeat * 2.0 + measuredEnergy * (4.4 + p.lightingFireIntensity * 0.85), 1.4, 13.0);
+        primaryAreaLight.lookAt(0.5 + lateralBias * 0.03, 0.18 + flameHeight * 0.34, 0.18);
 
-        runtime.fireLight.position.set(0.5, 0.22 + p.volumeHeight * 0.12, 0.5);
-        runtime.fireLight.intensity = clamp(0.65 + p.lightingFireIntensity * 0.30 + p.emission * 0.08, 0.4, 8.0);
-        runtime.fireLight.distance = clamp(1.6 + p.lightingFireFalloff * 1.8, 1.2, 8.8);
+        secondaryAreaLight.position.set(0.82, 0.16 + flameHeight * 0.34 + verticalBias * 0.03, 0.5 + lateralBias * 0.02);
+        secondaryAreaLight.width = sideWidth;
+        secondaryAreaLight.height = flameHeight * clamp(0.68 + measuredSpreadY * 0.22, 0.62, 0.9);
+        secondaryAreaLight.color.copy(fireColor).lerp(coreLightColor, 0.08);
+        secondaryAreaLight.intensity = clamp(primaryAreaLight.intensity * (0.42 + measuredCore * 0.18), 0.7, 7.4);
+        secondaryAreaLight.lookAt(0.24, 0.18 + flameHeight * 0.28, 0.5);
+
+        const floorHeat = projectFireRadianceAtPoint(
+          new THREE.Vector3(0.5 + lateralBias * 0.12, 0.0, 0.44),
+          new THREE.Vector3(0.0, 1.0, 0.0),
+          emitterPos,
+          radianceField.valid ? radianceField : runtime.radianceSampler.lastField
+        );
+        const wallHeat = projectFireRadianceAtPoint(
+          new THREE.Vector3(0.5 + lateralBias * 0.18, 1.3 + verticalBias * 0.45, -3.4),
+          new THREE.Vector3(0.0, 0.0, 1.0),
+          emitterPos,
+          radianceField.valid ? radianceField : runtime.radianceSampler.lastField
+        );
+
+        runtime.projectors.floor.position.set(0.5 + lateralBias * 0.22, 0.012, 0.48 - verticalBias * 0.05);
+        runtime.projectors.floor.scale.set(
+          clamp(1.8 + measuredSpreadX * 6.2 + measuredEnergy * 0.6, 1.2, 5.4),
+          clamp(1.9 + measuredSpreadY * 7.4 + measuredEnergy * 0.9, 1.4, 6.6),
+          1
+        );
+        runtime.projectors.floor.material.color.copy(fireColor);
+        runtime.projectors.floor.material.opacity = clamp(0.08 + floorHeat * 0.46 + measuredCore * 0.05, 0.0, 0.52);
+
+        runtime.projectors.wall.position.set(0.5 + lateralBias * 0.36, 1.22 + verticalBias * 0.62, -3.38);
+        runtime.projectors.wall.scale.set(
+          clamp(1.6 + measuredSpreadX * 5.4 + measuredEnergy * 0.45, 1.2, 5.2),
+          clamp(1.7 + measuredSpreadY * 6.8 + measuredEnergy * 0.55, 1.4, 5.8),
+          1
+        );
+        runtime.projectors.wall.material.color.copy(fireColor);
+        runtime.projectors.wall.material.opacity = clamp(0.04 + wallHeat * 0.34 + measuredCore * 0.04, 0.0, 0.38);
+
+        runtime.floorMaterial.color.copy(floorBaseColor);
+        runtime.floorMaterial.emissive.copy(fireColor);
+        runtime.floorMaterial.emissiveIntensity = clamp(floorHeat * 0.18, 0.0, 0.26);
 
         runtime.floorMaterial.roughness = clamp(
           0.22 + (1.0 - p.floorSpecular) * 0.58 + p.floorSootRoughness * 0.08,
           0.12,
           0.98
         );
-        runtime.floorMaterial.metalness = clamp(0.01 + p.floorSpecular * 0.24, 0.0, 0.4);
-        runtime.floorMaterial.clearcoat = clamp(0.05 + p.floorSpecular * 0.36, 0.0, 0.82);
-        runtime.floorMaterial.clearcoatRoughness = clamp(0.82 - p.floorSpecular * 0.68, 0.1, 0.95);
-        runtime.floorMaterial.envMapIntensity = clamp(0.6 + p.floorSpecular * 1.2, 0.2, 2.8);
+        runtime.floorMaterial.metalness = clamp(0.01 + p.floorSpecular * 0.22, 0.0, 0.4);
+        runtime.floorMaterial.clearcoat = clamp(0.05 + p.floorSpecular * 0.34, 0.0, 0.82);
+        runtime.floorMaterial.clearcoatRoughness = clamp(0.82 - p.floorSpecular * 0.66, 0.1, 0.95);
+        runtime.floorMaterial.envMapIntensity = clamp(0.55 + p.floorSpecular * 1.05, 0.2, 2.8);
 
-        runtime.wallMaterial.roughness = clamp(0.62 + p.smokeDarkness * 0.35, 0.45, 0.98);
-        runtime.wallMaterial.metalness = clamp(0.02 + p.floorSpecular * 0.08, 0.0, 0.18);
+        runtime.wallMaterial.color.copy(wallBaseColor);
+        runtime.wallMaterial.emissive.copy(fireColor);
+        runtime.wallMaterial.emissiveIntensity = clamp(wallHeat * 0.16, 0.0, 0.22);
+        runtime.wallMaterial.roughness = clamp(0.58 + p.smokeDarkness * 0.28, 0.42, 0.96);
+        runtime.wallMaterial.metalness = clamp(0.02 + p.floorSpecular * 0.05, 0.0, 0.16);
 
         updateWoodCombustionSystem(runtime, p, sceneRef.current, logCharSideColor, logCharCapColor);
+
+        const logHeat = projectFireRadianceAtPoint(
+          new THREE.Vector3(0.5, 0.16, 0.5),
+          new THREE.Vector3(0.0, 1.0, 0.0),
+          emitterPos,
+          radianceField.valid ? radianceField : runtime.radianceSampler.lastField
+        );
+        if (runtime.logSideMaterial) {
+          runtime.logSideMaterial.emissive.copy(fireColor);
+          runtime.logSideMaterial.emissiveIntensity = clamp(runtime.logSideMaterial.emissiveIntensity + logHeat * 0.26, 0.0, 0.92);
+          runtime.logSideMaterial.color.lerp(fireColor, clamp(logHeat * 0.035, 0.0, 0.08));
+        }
+        if (runtime.logCapMaterial) {
+          runtime.logCapMaterial.emissive.copy(fireColor);
+          runtime.logCapMaterial.emissiveIntensity = clamp(runtime.logCapMaterial.emissiveIntensity + logHeat * 0.18, 0.0, 0.62);
+          runtime.logCapMaterial.color.lerp(fireColor, clamp(logHeat * 0.03, 0.0, 0.06));
+        }
+
+        for (const receiver of runtime.propReceivers) {
+          const propHeat = projectFireRadianceAtPoint(
+            receiver.mesh.position,
+            receiver.normalHint,
+            emitterPos,
+            radianceField.valid ? radianceField : runtime.radianceSampler.lastField
+          ) * receiver.projectionGain;
+          receiver.material.color.copy(receiver.baseColor).lerp(fireColor, clamp(propHeat * receiver.tintGain, 0.0, 0.22));
+          receiver.material.emissive.copy(fireColor);
+          receiver.material.emissiveIntensity = clamp(propHeat * 0.2, 0.0, 0.34);
+        }
 
         runtime.renderer.render(runtime.scene, runtime.camera);
         runtime.lastWorldRenderMs = performance.now() - worldStartMs;
